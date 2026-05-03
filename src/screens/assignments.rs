@@ -129,16 +129,24 @@ fn fmt_due(ts: i64) -> (String, Option<&'static str>) {
 }
 
 fn fmt_remaining(diff: i64) -> String {
-    if diff < 3600 {
-        format!("{} min left", diff / 60)
-    } else if diff < 86_400 {
-        let h = diff / 3600;
-        let m = (diff % 3600) / 60;
-        if m > 0 { format!("{h}h {m}m left") } else { format!("{h}h left") }
+    fmt_duration(diff, "left")
+}
+
+fn fmt_overdue(diff: i64) -> String {
+    fmt_duration(diff, "overdue")
+}
+
+fn fmt_duration(secs: i64, suffix: &str) -> String {
+    if secs < 3600 {
+        format!("{} min {suffix}", secs / 60)
+    } else if secs < 86_400 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m > 0 { format!("{h}h {m}m {suffix}") } else { format!("{h}h {suffix}") }
     } else {
-        let d = diff / 86_400;
-        let h = (diff % 86_400) / 3600;
-        if h > 0 { format!("{d}d {h}h left") } else { format!("{d}d left") }
+        let d = secs / 86_400;
+        let h = (secs % 86_400) / 3600;
+        if h > 0 { format!("{d}d {h}h {suffix}") } else { format!("{d}d {suffix}") }
     }
 }
 
@@ -352,7 +360,7 @@ impl AssignmentsScreen {
                                 let color = urgency.due_text_color();
                                 let (due_str, midnight_note) = fmt_due(assign.duedate);
                                 let label = if diff < 0 {
-                                    format!("Overdue — was due {} ({})", due_str, fmt_remaining(diff.abs()))
+                                    format!("Overdue — was due {} ({})", due_str, fmt_overdue(diff.abs()))
                                 } else {
                                     format!("Due: {} — {}", due_str, fmt_remaining(diff))
                                 };

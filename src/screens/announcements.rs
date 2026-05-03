@@ -1,8 +1,9 @@
 use egui::Ui;
+use serde::{Deserialize, Serialize};
 use crate::api::types::ForumDiscussion;
 use crate::models::{decode_html, parse_year, year_label};
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct Announcement {
     pub discussion: ForumDiscussion,

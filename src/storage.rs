@@ -23,6 +23,11 @@ impl Storage {
                 total_secs  INTEGER NOT NULL DEFAULT 0,
                 last_opened TEXT
             );
+            CREATE TABLE IF NOT EXISTS cache (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
         ")?;
         Ok(Self { conn })
     }
@@ -68,6 +73,26 @@ impl Storage {
                total_secs = total_secs + excluded.total_secs",
             params![course_id as i64, seconds as i64],
         )?;
+        Ok(())
+    }
+
+    pub fn save_cache(&self, key: &str, value: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cache (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            params![key, value, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_cache(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT value FROM cache WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        Ok(rows.next()?.map(|r| r.get(0).unwrap()))
+    }
+
+    pub fn clear_cache(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM cache", [])?;
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 fn de_false_as_none<'de, D>(d: D) -> Result<Option<String>, D::Error>
 where D: serde::Deserializer<'de> {
@@ -44,7 +44,7 @@ pub struct AutoLoginResponse {
 
 // ── Courses ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Course {
     pub id: u64,
     pub fullname: String,
@@ -57,7 +57,7 @@ pub struct Course {
     pub summary: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CourseSection {
     pub id: u64,
     pub name: String,
@@ -67,7 +67,7 @@ pub struct CourseSection {
     pub modules: Vec<CourseModule>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CourseModule {
     pub id: u64,
     pub name: String,
@@ -78,9 +78,12 @@ pub struct CourseModule {
     pub url: Option<String>,
     #[serde(default)]
     pub contents: Vec<ModuleContent>,
+    /// Full HTML content (only present when returncontents=1, e.g. "page" modules)
+    #[serde(deserialize_with = "de_false_as_none", default)]
+    pub mainpage: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModuleContent {
     pub filename: String,
     pub fileurl: String,
@@ -95,7 +98,7 @@ pub struct AssignmentsResponse {
     pub courses: Vec<AssignmentCourse>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AssignmentCourse {
     pub id: u64,
     pub shortname: String,
@@ -104,7 +107,7 @@ pub struct AssignmentCourse {
     pub assignments: Vec<Assignment>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Assignment {
     pub id: u64,
     pub cmid: u64,
@@ -136,7 +139,7 @@ pub struct Submission {
 
 // ── Forums / Announcements ──────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Forum {
     pub id: u64,
     pub course: u64,
@@ -145,12 +148,12 @@ pub struct Forum {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ForumDiscussionsResponse {
     pub discussions: Vec<ForumDiscussion>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ForumDiscussion {
     pub id: u64,
     pub name: String,
@@ -167,12 +170,12 @@ pub struct ForumDiscussion {
 
 // ── Calendar ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CalendarEventList {
     pub events: Vec<CalendarEvent>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CalendarEvent {
     pub id: u64,
     pub name: String,
@@ -194,14 +197,14 @@ pub struct CalendarEvent {
 
 // ── Notifications ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct NotificationList {
     pub notifications: Vec<MoodleNotification>,
     #[serde(default)]
     pub unreadcount: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MoodleNotification {
     pub id: u64,
     pub subject: String,
@@ -267,7 +270,7 @@ pub struct GradeItemsResponse {
     pub usergrades: Vec<UserGrades>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UserGrades {
     pub courseid: u64,
     pub coursename: String,
@@ -275,7 +278,7 @@ pub struct UserGrades {
     pub gradeitems: Vec<GradeItem>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GradeItem {
     pub id: u64,
     #[serde(deserialize_with = "de_false_as_none", default)]

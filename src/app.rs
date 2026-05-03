@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 use crate::api::{is_token_error, types::*, MoodleClient};
@@ -8,7 +9,7 @@ use crate::screens::{
     assignments::AssignmentsScreen,
     calendar::CalendarScreen,
     courses::{CoursesEvent, CoursesScreen},
-    course_content::CourseContentScreen,
+    course_content::{CourseContentScreen, CourseContentEvent, DownloadState},
     grades::GradesScreen,
     login::LoginScreen,
     notifications::NotificationsScreen,
@@ -57,6 +58,8 @@ enum AppMsg {
     TokenExpired,
     NewNotifications(u64),
     OpenUrl(String),
+    FileDownloaded { module_id: u64, path: PathBuf },
+    FileDownloadFailed { module_id: u64, error: String },
 }
 
 pub struct App {
@@ -149,6 +152,39 @@ impl App {
                 app.userid = userid;
                 app.fullname = app.storage.get("fullname").ok().flatten().unwrap_or_default();
                 app.screen = Screen::Main;
+
+                // Pre-populate from cache (stale-while-revalidate)
+                if let Ok(Some(json)) = app.storage.load_cache("courses") {
+                    if let Ok(v) = serde_json::from_str::<Vec<Course>>(&json) {
+                        app.courses.courses = v;
+                    }
+                }
+                if let Ok(Some(json)) = app.storage.load_cache("announcements") {
+                    if let Ok(v) = serde_json::from_str::<Vec<Announcement>>(&json) {
+                        app.announcements.announcements = v;
+                    }
+                }
+                if let Ok(Some(json)) = app.storage.load_cache("assignments") {
+                    if let Ok(v) = serde_json::from_str::<Vec<AssignmentCourse>>(&json) {
+                        app.assignments.courses = v;
+                    }
+                }
+                if let Ok(Some(json)) = app.storage.load_cache("calendar") {
+                    if let Ok(v) = serde_json::from_str::<Vec<CalendarEvent>>(&json) {
+                        app.calendar.events = v;
+                    }
+                }
+                if let Ok(Some(json)) = app.storage.load_cache("notifications") {
+                    if let Ok(v) = serde_json::from_str::<Vec<MoodleNotification>>(&json) {
+                        app.notifications.notifications = v;
+                    }
+                }
+                if let Ok(Some(json)) = app.storage.load_cache("grades") {
+                    if let Ok(v) = serde_json::from_str::<Vec<UserGrades>>(&json) {
+                        app.grades.grades = v;
+                    }
+                }
+
                 let tx = app.tx.clone();
                 let username = app.storage.get("username").ok().flatten().unwrap_or_default();
                 let needs_private_token = private_token.is_empty();
@@ -337,6 +373,27 @@ impl App {
         });
     }
 
+    fn download_file(&self, module_id: u64, url: String, save_path: PathBuf) {
+        let token = self.token.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            let full_url = format!("{url}{sep}token={token}");
+            let result = async {
+                let bytes = reqwest::get(&full_url).await?.bytes().await?;
+                if let Some(parent) = save_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&save_path, &bytes)?;
+                Ok::<_, anyhow::Error>(save_path.clone())
+            }.await;
+            match result {
+                Ok(path) => { let _ = tx.send(AppMsg::FileDownloaded { module_id, path }); }
+                Err(e) => { let _ = tx.send(AppMsg::FileDownloadFailed { module_id, error: e.to_string() }); }
+            }
+        });
+    }
+
     fn flush_course_timer(&mut self) {
         if let (Some(id), Some(since)) = (self.focused_course, self.focus_since.take()) {
             let secs = since.elapsed().as_secs();
@@ -361,8 +418,21 @@ impl App {
                 
                 // Load course content
                 self.course_content.course_id = id;
+                self.course_content.course_shortname = self.courses.courses.iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.shortname.clone())
+                    .unwrap_or_default();
                 self.course_content.sections.clear();
                 self.course_content.loading = true;
+                self.course_content.needs_scroll = true;
+                self.course_content.download_states.clear();
+                // Load from cache first (stale-while-revalidate)
+                if let Ok(Some(json)) = self.storage.load_cache(&format!("course_content_{id}")) {
+                    if let Ok(v) = serde_json::from_str::<Vec<crate::api::types::CourseSection>>(&json) {
+                        self.course_content.sections = v;
+                        self.course_content.loading = false;
+                    }
+                }
                 self.fetch_course_content(id);
             }
             CoursesEvent::Deselected => {
@@ -376,6 +446,7 @@ impl App {
     fn do_logout(&mut self) {
         self.flush_course_timer();
         self.storage.clear_session().ok();
+        self.storage.clear_cache().ok();
         self.token.clear();
         self.private_token.clear();
         self.userid = 0;
@@ -579,10 +650,16 @@ impl eframe::App for App {
                     self.profile.student_year = self.student_year;
                     self.courses.courses = courses;
                     self.apply_year_defaults();
+                    if let Ok(json) = serde_json::to_string(&self.courses.courses) {
+                        let _ = self.storage.save_cache("courses", &json);
+                    }
                     ctx.request_repaint();
                 }
                 AppMsg::CourseContentLoaded { course_id, sections } => {
                     if self.course_content.course_id == course_id {
+                        if let Ok(json) = serde_json::to_string(&sections) {
+                            let _ = self.storage.save_cache(&format!("course_content_{course_id}"), &json);
+                        }
                         self.course_content.sections = sections;
                         self.course_content.loading = false;
                     }
@@ -590,10 +667,43 @@ impl eframe::App for App {
                 }
                 AppMsg::AnnouncementsLoaded(ann) => {
                     self.announcements.announcements = ann;
+                    if let Ok(json) = serde_json::to_string(&self.announcements.announcements) {
+                        let _ = self.storage.save_cache("announcements", &json);
+                    }
+                    // Feed announcements into calendar
+                    self.calendar.announcement_events = self.announcements.announcements.iter()
+                        .map(|a| CalendarEvent {
+                            id: a.discussion.id,
+                            name: a.discussion.name.clone(),
+                            description: Some(a.discussion.message.clone()),
+                            timestart: a.discussion.timecreated,
+                            timesort: a.discussion.timecreated,
+                            courseid: a.course_id,
+                            coursename: Some(a.course_name.clone()),
+                            modulename: Some("announcement".into()),
+                            eventtype: Some("announcement".into()),
+                        }).collect();
                     ctx.request_repaint();
                 }
                 AppMsg::AssignmentsLoaded(r) => {
                     self.assignments.courses = r.courses;
+                    if let Ok(json) = serde_json::to_string(&self.assignments.courses) {
+                        let _ = self.storage.save_cache("assignments", &json);
+                    }
+                    // Feed assignment due dates into calendar (full replace)
+                    self.calendar.assignment_events = self.assignments.courses.iter()
+                        .flat_map(|c| c.assignments.iter().filter(|a| a.duedate > 0).map(move |a| CalendarEvent {
+                            id: a.id,
+                            name: format!("{}: {}", c.shortname, a.name),
+                            description: a.intro.clone(),
+                            timestart: a.duedate,
+                            timesort: a.duedate,
+                            courseid: c.id,
+                            coursename: Some(c.fullname.clone()),
+                            modulename: Some("assign".into()),
+                            eventtype: Some("due".into()),
+                        }))
+                        .collect();
                     ctx.request_repaint();
                 }
                 AppMsg::AssignmentStatusLoaded { assign_id, status } => {
@@ -603,11 +713,17 @@ impl eframe::App for App {
                 }
                 AppMsg::CalendarLoaded(r) => {
                     self.calendar.events = r.events;
+                    if let Ok(json) = serde_json::to_string(&self.calendar.events) {
+                        let _ = self.storage.save_cache("calendar", &json);
+                    }
                     ctx.request_repaint();
                 }
                 AppMsg::NotificationsLoaded(r) => {
                     self.notifications.unread_count = r.unreadcount;
                     self.notifications.notifications = r.notifications;
+                    if let Ok(json) = serde_json::to_string(&self.notifications.notifications) {
+                        let _ = self.storage.save_cache("notifications", &json);
+                    }
                     ctx.request_repaint();
                 }
                 AppMsg::GradeOverviewLoaded(r) => {
@@ -624,12 +740,14 @@ impl eframe::App for App {
                 AppMsg::GradesDetailLoaded(detail) => {
                     for ug in detail {
                         self.grades.detail_loading.remove(&ug.courseid);
-                        // Replace existing or push new
                         if let Some(existing) = self.grades.grades.iter_mut().find(|g| g.courseid == ug.courseid) {
                             *existing = ug;
                         } else {
                             self.grades.grades.push(ug);
                         }
+                    }
+                    if let Ok(json) = serde_json::to_string(&self.grades.grades) {
+                        let _ = self.storage.save_cache("grades", &json);
                     }
                     ctx.request_repaint();
                 }
@@ -642,17 +760,51 @@ impl eframe::App for App {
                     let private_token = self.private_token.clone();
                     let token = self.token.clone();
                     tokio::spawn(async move {
-                        let mut target_url = url.clone();
+                        fn pct_encode(s: &str) -> String {
+                            s.bytes().map(|b| match b {
+                                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+                                | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+                                b => format!("%{:02X}", b),
+                            }).collect()
+                        }
+
+                        // Protected file: append wstoken for direct download
+                        if url.contains("/pluginfile.php") {
+                            let sep = if url.contains('?') { '&' } else { '?' };
+                            let _ = open::that(format!("{url}{sep}token={token}"));
+                            return;
+                        }
+
+                        // Try autologin if private_token available
                         if !private_token.is_empty() {
                             let client = MoodleClient::new(token);
                             if let Ok(resp) = client.get_autologin_url(&private_token).await {
-                                let encoded = url.replace('%', "%25").replace('&', "%26").replace('?', "%3F").replace('=', "%3D");
-                                target_url = format!("{}&url={}", resp.autologinurl, encoded);
+                                let _ = open::that(
+                                    format!("{}&url={}", resp.autologinurl, pct_encode(&url)));
+                                return;
                             }
+                            eprintln!("autologin API failed, using wantsurl fallback");
                         }
-                        // Fallback to default browser
-                        let _ = open::that(&target_url);
+
+                        // Fallback: wantsurl redirect — if browser has valid Moodle session it
+                        // goes directly to the page; if not, shows login then redirects there.
+                        const BASE: &str = "https://sci.cmb.ac.lk/lms";
+                        if url.starts_with(BASE) {
+                            let _ = open::that(
+                                format!("{BASE}/login/index.php?wantsurl={}", pct_encode(&url)));
+                        } else {
+                            let _ = open::that(&url);
+                        }
                     });
+                }
+                AppMsg::FileDownloaded { module_id, path } => {
+                    self.course_content.download_states.insert(module_id, DownloadState::Done(path.clone()));
+                    let _ = open::that(&path);
+                    ctx.request_repaint();
+                }
+                AppMsg::FileDownloadFailed { module_id, error } => {
+                    self.course_content.download_states.insert(module_id, DownloadState::Error(error));
+                    ctx.request_repaint();
                 }
                 AppMsg::NewNotifications(count) => {
                     self.notifications.unread_count += count;
@@ -762,8 +914,24 @@ impl eframe::App for App {
                                     });
                                 });
                                 egui::CentralPanel::default().show_inside(ui, |ui| {
-                                    if let Some(url) = self.course_content.show(ui) {
-                                        let _ = self.tx.send(AppMsg::OpenUrl(url));
+                                    match self.course_content.show(ui) {
+                                        Some(CourseContentEvent::OpenUrl(url)) => {
+                                            let _ = self.tx.send(AppMsg::OpenUrl(url));
+                                        }
+                                        Some(CourseContentEvent::Download { module_id, url, save_path }) => {
+                                            self.course_content.download_states.insert(module_id, DownloadState::Downloading);
+                                            self.download_file(module_id, url, save_path);
+                                        }
+                                        Some(CourseContentEvent::OpenFile(path)) => {
+                                            let _ = open::that(&path);
+                                        }
+                                        Some(CourseContentEvent::ShowFolder(path)) => {
+                                            let folder = path.parent()
+                                                .map(|p| p.to_path_buf())
+                                                .unwrap_or(path);
+                                            let _ = open::that(&folder);
+                                        }
+                                        None => {}
                                     }
                                 });
                             } else {

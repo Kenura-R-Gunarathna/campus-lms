@@ -70,6 +70,9 @@ impl MoodleClient {
     pub async fn course_contents(&self, course_id: u64) -> anyhow::Result<Vec<CourseSection>> {
         let mut p = self.base_params("core_course_get_contents");
         p.push(("courseid".into(), course_id.to_string()));
+        // Return full page HTML content so "page" modules can be shown inline
+        p.push(("options[0][name]".into(), "returncontents".into()));
+        p.push(("options[0][value]".into(), "1".into()));
         Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
             .query(&p).send().await?.json().await?)
     }
