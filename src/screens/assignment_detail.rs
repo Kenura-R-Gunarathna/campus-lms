@@ -1,5 +1,8 @@
 use egui::Ui;
-use crate::api::types::{Assignment, SubmissionStatusResponse, SubmissionFile};
+use std::sync::Arc;
+use std::borrow::Cow;
+use base64::Engine as _;
+use crate::api::types::{Assignment, IntroAttachment, SubmissionStatusResponse, SubmissionFile};
 use crate::models::decode_html;
 
 pub enum AssignmentDetailEvent {
@@ -8,6 +11,13 @@ pub enum AssignmentDetailEvent {
     SubmitForGrading,
     OpenFile { url: String },
     OpenInBrowser { url: String },
+}
+
+#[derive(Default, PartialEq, Clone, Copy)]
+pub enum DetailSource {
+    #[default]
+    Assignments,
+    CourseContent,
 }
 
 #[derive(Default, PartialEq)]
@@ -26,6 +36,10 @@ pub struct AssignmentDetailScreen {
     pub loading_status: bool,
     pub upload_state: UploadState,
     pub pending_file: Option<(String, Vec<u8>)>, // (filename, bytes) chosen but not yet uploaded
+    pub source: DetailSource,
+    pub token: String,
+    /// Decoded base64 inline images from the intro HTML: (uri, bytes)
+    pub intro_base64_images: Vec<(String, Arc<[u8]>)>,
 }
 
 impl Default for AssignmentDetailScreen {
@@ -37,6 +51,9 @@ impl Default for AssignmentDetailScreen {
             loading_status: false,
             upload_state: UploadState::Idle,
             pending_file: None,
+            source: DetailSource::Assignments,
+            token: String::new(),
+            intro_base64_images: Vec::new(),
         }
     }
 }
@@ -54,6 +71,32 @@ fn fmt_size(b: u64) -> String {
     else               { format!("{} B", b) }
 }
 
+fn attachment_info(a: &IntroAttachment) -> (&'static str, &'static str) {
+    let mime = a.mimetype.as_deref().unwrap_or("");
+    let name = a.filename.to_lowercase();
+    if mime.starts_with("image/") || name.ends_with(".jpg") || name.ends_with(".jpeg") || name.ends_with(".png") || name.ends_with(".gif") || name.ends_with(".webp") {
+        (egui_phosphor::regular::IMAGE, "Image")
+    } else if mime.starts_with("audio/") || name.ends_with(".mp3") || name.ends_with(".wav") || name.ends_with(".ogg") || name.ends_with(".m4a") {
+        (egui_phosphor::regular::MUSIC_NOTE, "Audio")
+    } else if mime.starts_with("video/") || name.ends_with(".mp4") || name.ends_with(".webm") || name.ends_with(".avi") || name.ends_with(".mov") {
+        (egui_phosphor::regular::FILM_STRIP, "Video")
+    } else if mime == "application/pdf" || name.ends_with(".pdf") {
+        (egui_phosphor::regular::FILE_PDF, "PDF")
+    } else {
+        (egui_phosphor::regular::PAPERCLIP, "File")
+    }
+}
+
+fn authed_url(url: &str, token: &str) -> String {
+    if token.is_empty() { return url.to_string(); }
+    if url.contains("/pluginfile.php") && !url.contains("token=") {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}token={token}")
+    } else {
+        url.to_string()
+    }
+}
+
 fn strip_html(s: &str) -> String {
     s.chars().fold((String::new(), false), |(mut acc, in_tag), c| {
         if c == '<' { (acc, true) }
@@ -61,6 +104,109 @@ fn strip_html(s: &str) -> String {
         else if !in_tag { acc.push(c); (acc, false) }
         else { (acc, in_tag) }
     }).0
+}
+
+struct MediaItem {
+    icon: &'static str,
+    kind: &'static str,
+    label: String,
+    url: String,
+}
+
+fn extract_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
+    let lower = tag.to_lowercase();
+    let needle = format!("{attr}=");
+    let start = lower.find(&needle)? + needle.len();
+    let after = &tag[start..];
+    if after.starts_with('"') {
+        let end = after[1..].find('"')?;
+        Some(&after[1..1 + end])
+    } else if after.starts_with('\'') {
+        let end = after[1..].find('\'')?;
+        Some(&after[1..1 + end])
+    } else {
+        let end = after.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(after.len());
+        Some(&after[..end])
+    }
+}
+
+/// Extract non-base64 media references from intro HTML (external images, audio, video, PDF links).
+fn extract_media(html: &str, token: &str) -> Vec<MediaItem> {
+    let mut items = Vec::new();
+    let lower = html.to_lowercase();
+
+    // <img src="https://..."> (skip data: URIs — those are rendered inline)
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<img") {
+        let ts = pos + rel;
+        let te = lower[ts..].find('>').map(|e| ts + e + 1).unwrap_or(html.len());
+        let tag = &html[ts..te];
+        if let Some(src) = extract_attr(tag, "src") {
+            if !src.starts_with("data:") && (src.starts_with("http://") || src.starts_with("https://")) {
+                let url = authed_url(src, token);
+                let label = src.rsplit('/').next().unwrap_or(src).to_string();
+                items.push(MediaItem { icon: egui_phosphor::regular::IMAGE, kind: "Image", label, url });
+            }
+        }
+        pos = te;
+    }
+
+    // <a href="..."> pointing to known media types
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<a ") {
+        let ts = pos + rel;
+        let te = lower[ts..].find('>').map(|e| ts + e + 1).unwrap_or(html.len());
+        let tag = &html[ts..te];
+        if let Some(href) = extract_attr(tag, "href") {
+            if href.starts_with("http://") || href.starts_with("https://") {
+                let hn = href.to_lowercase();
+                let (icon, kind) = if hn.ends_with(".mp3") || hn.ends_with(".wav") || hn.ends_with(".ogg") || hn.ends_with(".m4a") {
+                    (egui_phosphor::regular::MUSIC_NOTE, "Audio")
+                } else if hn.ends_with(".mp4") || hn.ends_with(".webm") || hn.ends_with(".avi") || hn.ends_with(".mov") {
+                    (egui_phosphor::regular::FILM_STRIP, "Video")
+                } else if hn.ends_with(".pdf") {
+                    (egui_phosphor::regular::FILE_PDF, "PDF")
+                } else {
+                    pos = te;
+                    continue;
+                };
+                let url = authed_url(href, token);
+                let label = href.rsplit('/').next().unwrap_or(href).to_string();
+                items.push(MediaItem { icon, kind, label, url });
+            }
+        }
+        pos = te;
+    }
+
+    items
+}
+
+/// Decode base64 `data:image/...;base64,...` URIs embedded in intro HTML.
+/// Returns (egui_uri, Arc<[u8]>) pairs for inline rendering.
+pub fn extract_intro_images(html: &str, assign_id: u64) -> Vec<(String, Arc<[u8]>)> {
+    let mut images = Vec::new();
+    let lower = html.to_lowercase();
+    let mut pos = 0;
+    let mut idx = 0usize;
+    while let Some(rel) = lower[pos..].find("<img") {
+        let ts = pos + rel;
+        let te = lower[ts..].find('>').map(|e| ts + e + 1).unwrap_or(html.len());
+        let tag = &html[ts..te];
+        if let Some(src) = extract_attr(tag, "src") {
+            if src.starts_with("data:image/") {
+                if let Some(comma) = src.find(',') {
+                    let b64 = &src[comma + 1..];
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                        let uri = format!("bytes://assign_{assign_id}_img_{idx}");
+                        images.push((uri, bytes.into()));
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        pos = te;
+    }
+    images
 }
 
 impl AssignmentDetailScreen {
@@ -120,8 +266,14 @@ impl AssignmentDetailScreen {
 
             // ── Description ──────────────────────────────────────────────────
             if let Some(intro) = &assign.intro {
-                let text = strip_html(&decode_html(intro));
-                if !text.trim().is_empty() {
+                let decoded = decode_html(intro);
+                let text = strip_html(&decoded);
+                let html_media = extract_media(&decoded, &self.token);
+                let has_text = !text.trim().is_empty();
+                let has_inline = !self.intro_base64_images.is_empty();
+                let has_media = !html_media.is_empty() || !assign.introattachments.is_empty();
+
+                if has_text || has_inline || has_media {
                     ui.label(egui::RichText::new("Instructions").size(13.0).strong());
                     ui.add_space(4.0);
                     egui::Frame::none()
@@ -130,7 +282,62 @@ impl AssignmentDetailScreen {
                         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
-                            ui.label(egui::RichText::new(text.trim()).size(13.0));
+                            if has_text {
+                                ui.label(egui::RichText::new(text.trim()).size(13.0));
+                            }
+                            // Inline base64 images
+                            for (uri, bytes) in &self.intro_base64_images {
+                                ui.add_space(6.0);
+                                let w = ui.available_width();
+                                ui.add(
+                                    egui::Image::from_bytes(
+                                        Cow::Owned(uri.clone()),
+                                        bytes.clone(),
+                                    )
+                                    .max_width(w)
+                                    .rounding(4.0),
+                                );
+                            }
+                            // Linked media: HTML-embedded + introattachments
+                            if has_media {
+                                if has_text || has_inline { ui.add_space(6.0); }
+                                ui.label(egui::RichText::new("Attachments / Media")
+                                    .size(11.0).color(ui.visuals().weak_text_color()));
+                                ui.add_space(2.0);
+                                for m in &html_media {
+                                    let url = m.url.clone();
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(m.icon)
+                                            .size(12.0)
+                                            .color(egui::Color32::from_rgb(100, 160, 230)));
+                                        let resp = ui.selectable_label(false,
+                                            egui::RichText::new(format!("{} — {}", m.kind, m.label))
+                                                .size(12.0)
+                                                .color(egui::Color32::from_rgb(100, 160, 230)));
+                                        if resp.clicked() {
+                                            event = Some(AssignmentDetailEvent::OpenFile { url });
+                                        }
+                                    });
+                                }
+                                for att in &assign.introattachments {
+                                    if att.fileurl.is_empty() { continue; }
+                                    let (icon, kind) = attachment_info(att);
+                                    let url = authed_url(&att.fileurl, &self.token);
+                                    let label = att.filename.clone();
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(icon)
+                                            .size(12.0)
+                                            .color(egui::Color32::from_rgb(100, 160, 230)));
+                                        let resp = ui.selectable_label(false,
+                                            egui::RichText::new(format!("{kind} — {label}"))
+                                                .size(12.0)
+                                                .color(egui::Color32::from_rgb(100, 160, 230)));
+                                        if resp.clicked() {
+                                            event = Some(AssignmentDetailEvent::OpenFile { url });
+                                        }
+                                    });
+                                }
+                            }
                         });
                     ui.add_space(10.0);
                 }

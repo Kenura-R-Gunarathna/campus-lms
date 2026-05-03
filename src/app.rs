@@ -6,7 +6,7 @@ use crate::background;
 use crate::models::{decode_html, infer_student_year, parse_dept, year_label};
 use crate::screens::{
     announcements::{Announcement, AnnouncementsScreen},
-    assignment_detail::{AssignmentDetailScreen, AssignmentDetailEvent, UploadState},
+    assignment_detail::{AssignmentDetailScreen, AssignmentDetailEvent, DetailSource, UploadState, extract_intro_images},
     assignments::AssignmentsScreen,
     calendar::CalendarScreen,
     courses::{CoursesEvent, CoursesScreen},
@@ -108,6 +108,7 @@ impl App {
         let (tx, rx) = channel();
         let storage = Storage::open().expect("storage init failed");
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
@@ -346,6 +347,61 @@ impl App {
                 }
             }
         });
+    }
+
+    fn handle_detail_event(&mut self, ev: AssignmentDetailEvent) {
+        match ev {
+            AssignmentDetailEvent::Back => {
+                self.assignment_detail.assignment = None;
+            }
+            AssignmentDetailEvent::UploadFile => {
+                if let Some(assign) = &self.assignment_detail.assignment {
+                    let id = assign.id;
+                    self.pick_file_for_assignment(id);
+                }
+            }
+            AssignmentDetailEvent::SubmitForGrading => {
+                if let Some((fname, data)) = self.assignment_detail.pending_file.take() {
+                    if let Some(assign) = &self.assignment_detail.assignment {
+                        let id = assign.id;
+                        self.assignment_detail.upload_state = UploadState::Uploading;
+                        self.upload_and_submit(id, fname, data);
+                    }
+                }
+            }
+            AssignmentDetailEvent::OpenFile { url } => {
+                let token = self.token.clone();
+                let sep = if url.contains('?') { '&' } else { '?' };
+                let _ = open::that(format!("{url}{sep}token={token}"));
+            }
+            AssignmentDetailEvent::OpenInBrowser { url } => {
+                let _ = self.tx.send(AppMsg::OpenUrl(url));
+            }
+        }
+    }
+
+    fn open_assignment_detail(&mut self, assign: crate::api::types::Assignment, course_name: String, source: DetailSource) {
+        let assign_id = assign.id;
+        let images = assign.intro.as_deref()
+            .map(|intro| extract_intro_images(&crate::models::decode_html(intro), assign.id))
+            .unwrap_or_default();
+        self.assignment_detail.intro_base64_images = images;
+        self.assignment_detail.assignment = Some(assign);
+        self.assignment_detail.course_name = course_name;
+        self.assignment_detail.source = source;
+        self.assignment_detail.token = self.token.clone();
+        self.assignment_detail.status = self.assignments.submission_statuses.get(&assign_id).cloned();
+        self.assignment_detail.loading_status = self.assignment_detail.status.is_none();
+        self.assignment_detail.upload_state = UploadState::Idle;
+        self.assignment_detail.pending_file = None;
+        if self.assignment_detail.status.is_none() && !self.assignments.loading_statuses.contains(&assign_id) {
+            self.assignments.loading_statuses.insert(assign_id);
+            self.fetch_assignment_status(assign_id);
+        }
+        if !self.assignments_loaded {
+            self.assignments_loaded = true;
+            self.fetch_assignments();
+        }
     }
 
     fn fetch_calendar(&self) {
@@ -1039,7 +1095,12 @@ impl eframe::App for App {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     match self.active_tab {
                         Tab::Courses => {
-                            if let Some(selected_id) = self.courses.selected_course {
+                            if self.assignment_detail.assignment.is_some()
+                                && self.assignment_detail.source == DetailSource::CourseContent {
+                                if let Some(ev) = self.assignment_detail.show(ui) {
+                                    self.handle_detail_event(ev);
+                                }
+                            } else if let Some(selected_id) = self.courses.selected_course {
                                 let name = self.courses.courses.iter()
                                     .find(|c| c.id == selected_id)
                                     .map(|c| c.fullname.clone())
@@ -1074,32 +1135,15 @@ impl eframe::App for App {
                                             if let Some(mid) = mid { self.record_activity(mid, "opened"); }
                                             let _ = open::that(&path);
                                         }
-                                        Some(CourseContentEvent::OpenAssignment { cmid, name: _ }) => {
-                                            // Find the Assignment by cmid in loaded assignments
+                                        Some(CourseContentEvent::OpenAssignment { cmid }) => {
                                             let found = self.assignments.courses.iter()
                                                 .flat_map(|c| c.assignments.iter().map(move |a| (a, c.fullname.clone())))
                                                 .find(|(a, _)| a.cmid == cmid)
                                                 .map(|(a, cn)| (a.clone(), cn));
                                             if let Some((assign, course_name)) = found {
-                                                let assign_id = assign.id;
-                                                self.assignment_detail.assignment = Some(assign);
-                                                self.assignment_detail.course_name = course_name;
-                                                self.assignment_detail.status = self.assignments.submission_statuses.get(&assign_id).cloned();
-                                                self.assignment_detail.loading_status = self.assignment_detail.status.is_none();
-                                                self.assignment_detail.upload_state = UploadState::Idle;
-                                                self.assignment_detail.pending_file = None;
-                                                if self.assignment_detail.status.is_none() && !self.assignments.loading_statuses.contains(&assign_id) {
-                                                    self.assignments.loading_statuses.insert(assign_id);
-                                                    self.fetch_assignment_status(assign_id);
-                                                }
-                                                // Load assignments if not yet fetched
-                                                if !self.assignments_loaded {
-                                                    self.assignments_loaded = true;
-                                                    self.fetch_assignments();
-                                                }
-                                                self.active_tab = Tab::Assignments;
+                                                // Stay on Courses tab — Back returns to course content
+                                                self.open_assignment_detail(assign, course_name, DetailSource::CourseContent);
                                             } else {
-                                                // Assignments not loaded yet — load them and open in browser as fallback
                                                 if !self.assignments_loaded {
                                                     self.assignments_loaded = true;
                                                     self.fetch_assignments();
@@ -1124,36 +1168,10 @@ impl eframe::App for App {
                         Tab::Announcements => { self.announcements.show(ui); }
                         Tab::Assignments  => {
                             use crate::screens::assignments::AssignmentsEvent;
-                            if self.assignment_detail.assignment.is_some() {
+                            if self.assignment_detail.assignment.is_some()
+                                && self.assignment_detail.source == DetailSource::Assignments {
                                 if let Some(ev) = self.assignment_detail.show(ui) {
-                                    match ev {
-                                        AssignmentDetailEvent::Back => {
-                                            self.assignment_detail.assignment = None;
-                                        }
-                                        AssignmentDetailEvent::UploadFile => {
-                                            if let Some(assign) = &self.assignment_detail.assignment {
-                                                let id = assign.id;
-                                                self.pick_file_for_assignment(id);
-                                            }
-                                        }
-                                        AssignmentDetailEvent::SubmitForGrading => {
-                                            if let Some((fname, data)) = self.assignment_detail.pending_file.take() {
-                                                if let Some(assign) = &self.assignment_detail.assignment {
-                                                    let id = assign.id;
-                                                    self.assignment_detail.upload_state = UploadState::Uploading;
-                                                    self.upload_and_submit(id, fname, data);
-                                                }
-                                            }
-                                        }
-                                        AssignmentDetailEvent::OpenFile { url } => {
-                                            let token = self.token.clone();
-                                            let sep = if url.contains('?') { '&' } else { '?' };
-                                            let _ = open::that(format!("{url}{sep}token={token}"));
-                                        }
-                                        AssignmentDetailEvent::OpenInBrowser { url } => {
-                                            let _ = self.tx.send(AppMsg::OpenUrl(url));
-                                        }
-                                    }
+                                    self.handle_detail_event(ev);
                                 }
                             } else if let Some(ev) = self.assignments.show(ui) {
                                 match ev {
@@ -1162,17 +1180,7 @@ impl eframe::App for App {
                                         self.fetch_assignment_status(id);
                                     }
                                     AssignmentsEvent::OpenDetail { assign, course_name } => {
-                                        let assign_id = assign.id;
-                                        self.assignment_detail.assignment = Some(assign.clone());
-                                        self.assignment_detail.course_name = course_name;
-                                        self.assignment_detail.status = self.assignments.submission_statuses.get(&assign_id).cloned();
-                                        self.assignment_detail.loading_status = self.assignment_detail.status.is_none();
-                                        self.assignment_detail.upload_state = UploadState::Idle;
-                                        self.assignment_detail.pending_file = None;
-                                        if self.assignment_detail.status.is_none() && !self.assignments.loading_statuses.contains(&assign_id) {
-                                            self.assignments.loading_statuses.insert(assign_id);
-                                            self.fetch_assignment_status(assign_id);
-                                        }
+                                        self.open_assignment_detail(assign, course_name, DetailSource::Assignments);
                                     }
                                 }
                             }
@@ -1187,7 +1195,12 @@ impl eframe::App for App {
                                 }
                             }
                         }
-                        Tab::Notifications => { self.notifications.show(ui); }
+                        Tab::Notifications => {
+                            use crate::screens::notifications::NotificationsEvent;
+                            if let Some(NotificationsEvent::OpenUrl(url)) = self.notifications.show(ui) {
+                                let _ = self.tx.send(AppMsg::OpenUrl(url));
+                            }
+                        }
                         Tab::Grades => {
                             if let Some(cid) = self.grades.show(ui) {
                                 if !self.grades.detail_loading.contains(&cid) {

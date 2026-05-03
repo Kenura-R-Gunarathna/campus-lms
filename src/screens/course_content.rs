@@ -10,7 +10,7 @@ const MOODLE_BASE: &str = "https://sci.cmb.ac.lk/lms";
 
 pub enum CourseContentEvent {
     OpenUrl { url: String, module_id: u64 },
-    OpenAssignment { cmid: u64, name: String },
+    OpenAssignment { cmid: u64 },
     Download { module_id: u64, url: String, save_path: PathBuf },
     OpenFile(PathBuf),
     ShowFolder(PathBuf),
@@ -534,7 +534,7 @@ fn render_module(
         if click_resp.clicked() {
             event = Some(match action {
                 ModuleAction::OpenUrl(url) => CourseContentEvent::OpenUrl { url, module_id: module.id },
-                ModuleAction::OpenAssignment => CourseContentEvent::OpenAssignment { cmid: module.id, name: module.name.clone() },
+                ModuleAction::OpenAssignment => CourseContentEvent::OpenAssignment { cmid: module.id },
                 ModuleAction::Stream(url, _) => CourseContentEvent::OpenUrl { url, module_id: module.id },
                 ModuleAction::Download(url, _, path) => CourseContentEvent::Download {
                     module_id: module.id, url, save_path: path,

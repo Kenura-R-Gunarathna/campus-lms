@@ -21,3 +21,5 @@ rand = "0.8"
 egui-phosphor = "0.7.2"
 similar = "2"
 rfd = "0.14"
+egui_extras = { version = "0.29", features = ["image"] }
+base64 = "0.21"

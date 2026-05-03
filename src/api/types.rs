@@ -140,6 +140,20 @@ pub struct Assignment {
     pub cutoffdate: i64,
     #[serde(deserialize_with = "de_false_as_none", default)]
     pub intro: Option<String>,
+    #[serde(default)]
+    pub introattachments: Vec<IntroAttachment>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct IntroAttachment {
+    #[serde(deserialize_with = "de_false_as_empty", default)]
+    pub filename: String,
+    #[serde(deserialize_with = "de_false_as_empty", default)]
+    pub fileurl: String,
+    #[serde(deserialize_with = "de_false_as_zero_u64", default)]
+    pub filesize: u64,
+    #[serde(deserialize_with = "de_false_as_none", default)]
+    pub mimetype: Option<String>,
 }
 
 impl Assignment {
