@@ -1,5 +1,5 @@
 use egui::Ui;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use crate::api::types::MoodleNotification;
 
 fn is_relevant(n: &MoodleNotification, now: i64) -> bool {
@@ -36,14 +36,14 @@ fn fmt_age(ts: i64, now: i64) -> String {
     else { format!("{m}m ago") }
 }
 
-fn notif_icon(subject: &str) -> &'static str {
+fn notif_icon(subject: &str) -> (&'static str, &'static str) {
     let s = subject.to_lowercase();
-    if s.contains("submitted") || s.contains("submission") { "📄" }
-    else if s.contains("upcoming") || s.contains("due") { "⏰" }
-    else if s.contains("grade") || s.contains("graded") { "🎓" }
-    else if s.contains("sign in") { "🔑" }
-    else if s.contains("message") { "💬" }
-    else { "🔔" }
+    if s.contains("submitted") || s.contains("submission") { (egui_phosphor::regular::FILE_TEXT, "Submission") }
+    else if s.contains("upcoming") || s.contains("due") { (egui_phosphor::regular::CLOCK, "Upcoming Alert") }
+    else if s.contains("grade") || s.contains("graded") { (egui_phosphor::regular::GRADUATION_CAP, "Grade Update") }
+    else if s.contains("sign in") { (egui_phosphor::regular::SIGN_IN, "Security Alert") }
+    else if s.contains("message") { (egui_phosphor::regular::CHAT_CIRCLE, "Message") }
+    else { (egui_phosphor::regular::BELL, "Notification") }
 }
 
 pub struct NotificationsScreen {
@@ -103,7 +103,7 @@ impl NotificationsScreen {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for notif in visible {
                     ui.add_space(4.0);
-                    let icon = notif_icon(&notif.subject);
+                    let (icon, tooltip) = notif_icon(&notif.subject);
                     let age_str = fmt_age(notif.timecreated, now);
 
                     let bg = if !notif.is_read {
@@ -118,7 +118,8 @@ impl NotificationsScreen {
                         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(icon).size(16.0));
+                                ui.label(egui::RichText::new(icon).size(14.0).color(ui.visuals().weak_text_color()))
+                                    .on_hover_text(tooltip);
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new(&notif.subject).size(14.0)

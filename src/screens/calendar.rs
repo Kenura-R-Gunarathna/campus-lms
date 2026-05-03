@@ -1,6 +1,7 @@
 use egui::Ui;
 use chrono::{Datelike, NaiveDate, Utc};
 use crate::api::types::CalendarEvent;
+use crate::models::decode_html;
 
 fn days_in_month(year: i32, month: u32) -> u32 {
     let next = if month == 12 {
@@ -24,17 +25,46 @@ fn event_color(ev: &CalendarEvent) -> egui::Color32 {
     }
 }
 
-fn decode_html(s: &str) -> String {
-    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-     .replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ")
+fn get_event_time(ev: &CalendarEvent) -> i64 {
+    if ev.timesort > 0 { ev.timesort } else { ev.timestart }
+}
+
+fn fmt_event_time(ts: i64) -> (String, Option<&'static str>) {
+    let dt: chrono::DateTime<chrono::Local> =
+        chrono::DateTime::from(chrono::DateTime::<Utc>::from_timestamp(ts, 0).unwrap());
+    let base = dt.format("%A, %d %b %Y  %H:%M").to_string();
+    
+    use chrono::Timelike;
+    let note = if dt.hour() == 0 && dt.minute() == 0 {
+        Some("midnight = start of this day, not end of previous")
+    } else if dt.hour() == 23 && dt.minute() == 59 {
+        Some("11:59 PM = end of this day")
+    } else {
+        None
+    };
+    (base, note)
+}
+
+#[derive(PartialEq, Clone, Copy)]
+#[allow(dead_code)]
+pub enum CalendarView { Month, Week, Day }
+
+pub enum CalendarScreenEvent {
+    DeletePersonal(u64),
 }
 
 pub struct CalendarScreen {
     pub events: Vec<CalendarEvent>,
+    pub personal_events: Vec<CalendarEvent>,
     pub year: i32,
     pub month: u32,
     pub selected_day: Option<u32>,
     pub detail_event: Option<CalendarEvent>,
+    pub showing_add_event: bool,
+    pub new_event_name: String,
+    pub show_personal_events: bool,
+    #[allow(dead_code)]
+    pub view: CalendarView,
 }
 
 impl Default for CalendarScreen {
@@ -42,30 +72,51 @@ impl Default for CalendarScreen {
         let today = Utc::now().date_naive();
         Self {
             events: vec![],
+            personal_events: vec![],
             year: today.year(),
             month: today.month(),
             selected_day: Some(today.day()),
             detail_event: None,
+            showing_add_event: false,
+            new_event_name: String::new(),
+            show_personal_events: true,
+            view: CalendarView::Month,
         }
     }
 }
 
 impl CalendarScreen {
-    pub fn show(&mut self, ui: &mut Ui) {
+    pub fn show(&mut self, ui: &mut Ui) -> Option<CalendarScreenEvent> {
+        let mut ret_event = None;
         let today = Utc::now().date_naive();
+        
+        let all_events: Vec<CalendarEvent> = if self.show_personal_events {
+            self.events.iter().cloned()
+                .chain(self.personal_events.iter().cloned())
+                .collect()
+        } else {
+            self.events.clone()
+        };
 
         egui::TopBottomPanel::top("cal_topbar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Calendar").size(16.0).strong());
+                
+                if ui.button("+ Add Activity").clicked() {
+                    self.showing_add_event = !self.showing_add_event;
+                }
+                ui.separator();
+                ui.checkbox(&mut self.show_personal_events, "Show personal");
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("▶").clicked() {
+                    if ui.small_button(egui_phosphor::regular::CARET_RIGHT).clicked() {
                         if self.month == 12 { self.month = 1; self.year += 1; }
                         else { self.month += 1; }
                         self.selected_day = None;
                     }
                     ui.label(egui::RichText::new(
                         format!("{} {}", month_name(self.month), self.year)).size(14.0).strong());
-                    if ui.small_button("◀").clicked() {
+                    if ui.small_button(egui_phosphor::regular::CARET_LEFT).clicked() {
                         if self.month == 1 { self.month = 12; self.year -= 1; }
                         else { self.month -= 1; }
                         self.selected_day = None;
@@ -89,17 +140,21 @@ impl CalendarScreen {
                         ui.label(egui::RichText::new(decode_html(&ev.name)).size(15.0).strong());
                         ui.add_space(6.0);
 
-                        if ev.timestart > 0 {
-                            let dt: chrono::DateTime<chrono::Local> =
-                                chrono::DateTime::from(chrono::DateTime::<Utc>::from_timestamp(ev.timestart, 0).unwrap());
-                            ui.label(egui::RichText::new(dt.format("📅 %A, %d %b %Y  %H:%M").to_string()).size(13.0));
+                        let ts = get_event_time(ev);
+                        if ts > 0 {
+                            let (time_str, note) = fmt_event_time(ts);
+                            ui.label(egui::RichText::new(time_str).size(13.0));
+                            if let Some(n) = note {
+                                ui.label(egui::RichText::new(format!("! {n}"))
+                                    .size(11.0).color(egui::Color32::from_rgb(255, 200, 80)));
+                            }
                         }
                         if let Some(course) = &ev.coursename {
-                            ui.label(egui::RichText::new(format!("📚 {course}")).size(12.0)
+                            ui.label(egui::RichText::new(format!("Course: {course}")).size(12.0)
                                 .color(ui.visuals().weak_text_color()));
                         }
                         if let Some(m) = &ev.modulename {
-                            ui.label(egui::RichText::new(format!("🔧 {m}")).size(12.0)
+                            ui.label(egui::RichText::new(format!("Type: {m}")).size(12.0)
                                 .color(ui.visuals().weak_text_color()));
                         }
                         if let Some(desc) = &ev.description {
@@ -116,6 +171,14 @@ impl CalendarScreen {
                                 ui.label(egui::RichText::new(plain.trim()).size(12.0));
                             }
                         }
+                        
+                        if ev.eventtype.as_deref() == Some("user") {
+                            ui.add_space(10.0);
+                            if ui.button("Delete Activity").clicked() {
+                                ret_event = Some(CalendarScreenEvent::DeletePersonal(ev.id));
+                                self.detail_event = None;
+                            }
+                        }
                     } else {
                         // Day event list
                         let day_label = if let Some(d) = self.selected_day {
@@ -127,9 +190,10 @@ impl CalendarScreen {
                         ui.separator();
 
                         if let Some(day) = self.selected_day {
-                            let day_events: Vec<&CalendarEvent> = self.events.iter()
+                            let day_events: Vec<&CalendarEvent> = all_events.iter()
                                 .filter(|e| {
-                                    let dt = chrono::DateTime::<Utc>::from_timestamp(e.timestart, 0)
+                                    let ts = get_event_time(e);
+                                    let dt = chrono::DateTime::<Utc>::from_timestamp(ts, 0)
                                         .unwrap().date_naive();
                                     dt.year() == self.year && dt.month() == self.month && dt.day() == day
                                 })
@@ -147,7 +211,8 @@ impl CalendarScreen {
                                     .rounding(4.0)
                                     .inner_margin(8.0)
                                     .show(ui, |ui| {
-                                        ui.colored_label(color, "●");
+                                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                        ui.painter().circle_filled(dot_rect.center(), 4.0, color);
                                         ui.label(egui::RichText::new(decode_html(&ev.name)).size(13.0));
                                         if let Some(c) = &ev.coursename {
                                             ui.label(egui::RichText::new(c).size(11.0)
@@ -161,24 +226,25 @@ impl CalendarScreen {
                         } else {
                             // Show upcoming events summary
                             let now_ts = Utc::now().timestamp();
-                            let mut upcoming: Vec<&CalendarEvent> = self.events.iter()
-                                .filter(|e| e.timestart >= now_ts)
+                            let mut upcoming: Vec<&CalendarEvent> = all_events.iter()
+                                .filter(|e| get_event_time(e) >= now_ts)
                                 .take(10)
                                 .collect();
-                            upcoming.sort_by_key(|e| e.timestart);
+                            upcoming.sort_by_key(|e| get_event_time(e));
 
-                            if upcoming.is_empty() && !self.events.is_empty() {
+                            if upcoming.is_empty() && !all_events.is_empty() {
                                 ui.label(egui::RichText::new("No upcoming events")
                                     .color(ui.visuals().weak_text_color()));
                             }
-                            if self.events.is_empty() {
+                            if all_events.is_empty() && self.events.is_empty() {
                                 ui.spinner();
                             }
 
                             for ev in upcoming {
                                 ui.add_space(4.0);
+                                let ts = get_event_time(ev);
                                 let dt: chrono::DateTime<chrono::Local> =
-                                    chrono::DateTime::from(chrono::DateTime::<Utc>::from_timestamp(ev.timestart, 0).unwrap());
+                                    chrono::DateTime::from(chrono::DateTime::<Utc>::from_timestamp(ts, 0).unwrap());
                                 let color = event_color(ev);
                                 if egui::Frame::none()
                                     .fill(ui.visuals().faint_bg_color)
@@ -186,7 +252,8 @@ impl CalendarScreen {
                                     .inner_margin(8.0)
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            ui.colored_label(color, "●");
+                                            let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                        ui.painter().circle_filled(dot_rect.center(), 4.0, color);
                                             ui.label(egui::RichText::new(decode_html(&ev.name)).size(13.0));
                                         });
                                         ui.label(egui::RichText::new(dt.format("%d %b, %H:%M").to_string())
@@ -203,6 +270,51 @@ impl CalendarScreen {
 
         // Month grid
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            if self.showing_add_event {
+                egui::Window::new("New Personal Activity")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut self.new_event_name);
+                        
+                        let day_str = self.selected_day.map(|d| d.to_string()).unwrap_or_else(|| "none".into());
+                        ui.label(format!("Date: {} {} {} (Select on calendar)", day_str, month_name(self.month), self.year));
+                        
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                if !self.new_event_name.trim().is_empty() {
+                                    if let Some(day) = self.selected_day {
+                                        let dt = NaiveDate::from_ymd_opt(self.year, self.month, day).unwrap()
+                                            .and_hms_opt(12, 0, 0).unwrap();
+                                        let ts = dt.and_local_timezone(chrono::Local).unwrap().timestamp();
+                                        
+                                        self.personal_events.push(CalendarEvent {
+                                            id: rand::random(),
+                                            name: self.new_event_name.clone(),
+                                            description: None,
+                                            timestart: ts,
+                                            timesort: ts,
+                                            courseid: 0,
+                                            coursename: Some("Personal".into()),
+                                            modulename: Some("personal".into()),
+                                            eventtype: Some("user".into()),
+                                        });
+                                        self.new_event_name.clear();
+                                        self.showing_add_event = false;
+                                    }
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.showing_add_event = false;
+                                self.new_event_name.clear();
+                            }
+                        });
+                    });
+            }
+
             let dim = days_in_month(self.year, self.month);
             let first_day = NaiveDate::from_ymd_opt(self.year, self.month, 1).unwrap();
             // ISO weekday: Mon=0 .. Sun=6
@@ -227,21 +339,14 @@ impl CalendarScreen {
             });
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let mut col = start_offset;
-                let mut row_start = true;
-                let mut row_rect_start = ui.cursor().min;
-
                 if start_offset > 0 {
                     // Allocate empty cells for offset
                     ui.horizontal(|ui| {
                         for _ in 0..start_offset {
                             ui.allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::hover());
                         }
-                        row_start = false;
                     });
                 }
-
-                let mut day_ui_cells: Vec<(u32, egui::Rect)> = Vec::new();
 
                 // We need to lay out cells row by row
                 let mut current_col = start_offset;
@@ -262,10 +367,6 @@ impl CalendarScreen {
                     rows.push(current_row);
                 }
 
-                let _ = col;
-                let _ = row_start;
-                let _ = row_rect_start;
-
                 for row in rows {
                     ui.horizontal(|ui| {
                         for cell in row {
@@ -278,9 +379,10 @@ impl CalendarScreen {
                                     let is_selected = self.selected_day == Some(d);
 
                                     // Count events on this day
-                                    let day_events: Vec<&CalendarEvent> = self.events.iter()
+                                    let day_events: Vec<&CalendarEvent> = all_events.iter()
                                         .filter(|e| {
-                                            let dt = chrono::DateTime::<Utc>::from_timestamp(e.timestart, 0)
+                                            let ts = get_event_time(e);
+                                            let dt = chrono::DateTime::<Utc>::from_timestamp(ts, 0)
                                                 .unwrap().date_naive();
                                             dt.year() == self.year && dt.month() == self.month && dt.day() == d
                                         })
@@ -358,5 +460,7 @@ impl CalendarScreen {
                 }
             });
         });
+
+        ret_event
     }
 }

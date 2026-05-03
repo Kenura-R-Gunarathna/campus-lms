@@ -13,7 +13,7 @@ pub struct MoodleClient {
 }
 
 impl MoodleClient {
-    pub async fn login(username: &str, password: &str) -> anyhow::Result<(String, SiteInfo)> {
+    pub async fn login(username: &str, password: &str) -> anyhow::Result<(String, String, SiteInfo)> {
         let http = Client::new();
         let resp: TokenResponse = http
             .post(format!("{BASE}/login/token.php"))
@@ -26,9 +26,10 @@ impl MoodleClient {
 
         if let Some(err) = resp.error { bail!("Login failed: {err}"); }
         let token = resp.token.ok_or_else(|| anyhow!("No token"))?;
+        let private_token = resp.privatetoken.unwrap_or_default();
         let client = Self::new(token.clone());
         let info = client.site_info().await?;
-        Ok((token, info))
+        Ok((token, private_token, info))
     }
 
     pub fn new(token: String) -> Self {
@@ -52,9 +53,23 @@ impl MoodleClient {
         Ok(info)
     }
 
+    pub async fn get_autologin_url(&self, privatetoken: &str) -> anyhow::Result<AutoLoginResponse> {
+        let mut p = self.base_params("tool_mobile_get_autologin_key");
+        p.push(("privatetoken".into(), privatetoken.into()));
+        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+            .query(&p).send().await?.json().await?)
+    }
+
     pub async fn enrolled_courses(&self, userid: u64) -> anyhow::Result<Vec<Course>> {
         let mut p = self.base_params("core_enrol_get_users_courses");
         p.push(("userid".into(), userid.to_string()));
+        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+            .query(&p).send().await?.json().await?)
+    }
+
+    pub async fn course_contents(&self, course_id: u64) -> anyhow::Result<Vec<CourseSection>> {
+        let mut p = self.base_params("core_course_get_contents");
+        p.push(("courseid".into(), course_id.to_string()));
         Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
             .query(&p).send().await?.json().await?)
     }
@@ -64,6 +79,30 @@ impl MoodleClient {
         for (i, id) in course_ids.iter().enumerate() {
             p.push((format!("courseids[{i}]"), id.to_string()));
         }
+        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+            .query(&p).send().await?.json().await?)
+    }
+
+    pub async fn submission_status(&self, assign_id: u64) -> anyhow::Result<SubmissionStatusResponse> {
+        let mut p = self.base_params("mod_assign_get_submission_status");
+        p.push(("assignid".into(), assign_id.to_string()));
+        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+            .query(&p).send().await?.json().await?)
+    }
+
+    pub async fn forums_by_courses(&self, course_ids: &[u64]) -> anyhow::Result<Vec<Forum>> {
+        let mut p = self.base_params("mod_forum_get_forums_by_courses");
+        for (i, id) in course_ids.iter().enumerate() {
+            p.push((format!("courseids[{i}]"), id.to_string()));
+        }
+        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+            .query(&p).send().await?.json().await?)
+    }
+
+    pub async fn forum_discussions(&self, forum_id: u64) -> anyhow::Result<ForumDiscussionsResponse> {
+        let mut p = self.base_params("mod_forum_get_forum_discussions_paginated");
+        p.push(("forumid".into(), forum_id.to_string()));
+        p.push(("perpage".into(), "20".into()));
         Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
             .query(&p).send().await?.json().await?)
     }

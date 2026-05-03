@@ -2,11 +2,13 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 use crate::api::{is_token_error, types::*, MoodleClient};
 use crate::background;
-use crate::models::{infer_student_year, parse_dept, year_label};
+use crate::models::{decode_html, infer_student_year, parse_dept, year_label};
 use crate::screens::{
+    announcements::{Announcement, AnnouncementsScreen},
     assignments::AssignmentsScreen,
     calendar::CalendarScreen,
     courses::{CoursesEvent, CoursesScreen},
+    course_content::CourseContentScreen,
     grades::GradesScreen,
     login::LoginScreen,
     notifications::NotificationsScreen,
@@ -17,12 +19,13 @@ use crate::storage::Storage;
 const KEYRING_SERVICE: &str = "campus-lms";
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { Courses, Assignments, Calendar, Notifications, Grades, Profile }
+enum Tab { Courses, Announcements, Assignments, Calendar, Notifications, Grades, Profile }
 
 impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::Courses       => "Courses",
+            Tab::Announcements => "Announcements",
             Tab::Assignments   => "Assignments",
             Tab::Calendar      => "Calendar",
             Tab::Notifications => "Notifications",
@@ -32,17 +35,20 @@ impl Tab {
     }
 }
 const TABS: &[Tab] = &[
-    Tab::Courses, Tab::Assignments, Tab::Calendar,
+    Tab::Courses, Tab::Announcements, Tab::Assignments, Tab::Calendar,
     Tab::Notifications, Tab::Grades, Tab::Profile,
 ];
 
 enum Screen { Login, Main }
 
 enum AppMsg {
-    LoginOk { token: String, info: SiteInfo },
+    LoginOk { token: String, private_token: String, info: SiteInfo },
     LoginErr(String),
     CoursesLoaded(Vec<Course>),
+    CourseContentLoaded { course_id: u64, sections: Vec<CourseSection> },
+    AnnouncementsLoaded(Vec<Announcement>),
     AssignmentsLoaded(AssignmentsResponse),
+    AssignmentStatusLoaded { assign_id: u64, status: SubmissionStatusResponse },
     CalendarLoaded(CalendarEventList),
     NotificationsLoaded(NotificationList),
     GradeOverviewLoaded(GradeOverviewResponse),
@@ -50,6 +56,7 @@ enum AppMsg {
     ProfileLoaded(UserProfile),
     TokenExpired,
     NewNotifications(u64),
+    OpenUrl(String),
 }
 
 pub struct App {
@@ -57,6 +64,8 @@ pub struct App {
     active_tab: Tab,
     login: LoginScreen,
     courses: CoursesScreen,
+    course_content: CourseContentScreen,
+    announcements: AnnouncementsScreen,
     assignments: AssignmentsScreen,
     calendar: CalendarScreen,
     notifications: NotificationsScreen,
@@ -64,6 +73,7 @@ pub struct App {
     profile: ProfileScreen,
     storage: Storage,
     token: String,
+    private_token: String,
     userid: u64,
     fullname: String,
     student_year: Option<u8>,
@@ -71,6 +81,7 @@ pub struct App {
     focused_course: Option<u64>,
     focus_since: Option<Instant>,
     // Data loaded flags
+    announcements_loaded: bool,
     assignments_loaded: bool,
     calendar_loaded: bool,
     notifications_loaded: bool,
@@ -89,6 +100,10 @@ impl App {
         let storage = Storage::open().expect("storage init failed");
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        cc.egui_ctx.set_fonts(fonts);
+
         let bg_enabled = background::autostart_enabled();
 
         let mut app = Self {
@@ -96,6 +111,8 @@ impl App {
             active_tab: Tab::Courses,
             login: LoginScreen::default(),
             courses: CoursesScreen::default(),
+            course_content: CourseContentScreen::default(),
+            announcements: AnnouncementsScreen::default(),
             assignments: AssignmentsScreen::default(),
             calendar: CalendarScreen::default(),
             notifications: NotificationsScreen::default(),
@@ -103,11 +120,13 @@ impl App {
             profile: ProfileScreen::default(),
             storage,
             token: String::new(),
+            private_token: String::new(),
             userid: 0,
             fullname: String::new(),
             student_year: None,
             focused_course: None,
             focus_since: None,
+            announcements_loaded: false,
             assignments_loaded: false,
             calendar_loaded: false,
             notifications_loaded: false,
@@ -125,20 +144,34 @@ impl App {
         ) {
             if let Ok(userid) = uid.parse::<u64>() {
                 app.token = token.clone();
+                let private_token = app.storage.get("private_token").ok().flatten().unwrap_or_default();
+                app.private_token = private_token.clone();
                 app.userid = userid;
                 app.fullname = app.storage.get("fullname").ok().flatten().unwrap_or_default();
                 app.screen = Screen::Main;
                 let tx = app.tx.clone();
                 let username = app.storage.get("username").ok().flatten().unwrap_or_default();
+                let needs_private_token = private_token.is_empty();
                 tokio::spawn(async move {
                     let client = MoodleClient::new(token.clone());
                     match client.enrolled_courses(userid).await {
-                        Ok(courses) => { let _ = tx.send(AppMsg::CoursesLoaded(courses)); }
+                        Ok(courses) => { 
+                            let _ = tx.send(AppMsg::CoursesLoaded(courses)); 
+                            if needs_private_token {
+                                if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &username) {
+                                    if let Ok(password) = entry.get_password() {
+                                        if let Ok((t, pt, info)) = MoodleClient::login(&username, &password).await {
+                                            let _ = tx.send(AppMsg::LoginOk { token: t, private_token: pt, info });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Err(e) if is_token_error(&e) => {
                             if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &username) {
                                 if let Ok(password) = entry.get_password() {
                                     match MoodleClient::login(&username, &password).await {
-                                        Ok((t, info)) => { let _ = tx.send(AppMsg::LoginOk { token: t, info }); }
+                                        Ok((t, pt, info)) => { let _ = tx.send(AppMsg::LoginOk { token: t, private_token: pt, info }); }
                                         Err(_) => { let _ = tx.send(AppMsg::TokenExpired); }
                                     }
                                     return;
@@ -158,9 +191,46 @@ impl App {
     fn apply_year_defaults(&mut self) {
         if let Some(y) = self.student_year {
             if self.courses.year_filter.is_none()     { self.courses.year_filter     = Some(y); }
+            if self.announcements.year_filter.is_none() { self.announcements.year_filter = Some(y); }
+            self.announcements.student_year = Some(y);
             if self.assignments.year_filter.is_none() { self.assignments.year_filter = Some(y); }
+            self.assignments.student_year = Some(y);
             if self.grades.year_filter.is_none()      { self.grades.year_filter      = Some(y); }
         }
+    }
+
+    fn fetch_announcements(&self) {
+        let courses: Vec<(u64, String)> = self.courses.courses.iter()
+            .map(|c| (c.id, c.shortname.clone()))
+            .collect();
+        if courses.is_empty() { return; }
+        let token = self.token.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let client = MoodleClient::new(token);
+            match client.forums_by_courses(&courses.iter().map(|(id, _)| *id).collect::<Vec<_>>()).await {
+                Ok(forums) => {
+                    let mut all_ann = vec![];
+                    for forum in forums {
+                        if forum.forum_type == "news" || forum.name.to_lowercase().contains("announcement") {
+                            if let Ok(resp) = client.forum_discussions(forum.id).await {
+                                let course_name = courses.iter().find(|(id, _)| *id == forum.course)
+                                    .map(|(_, n)| n.clone()).unwrap_or_default();
+                                for disc in resp.discussions {
+                                    all_ann.push(Announcement {
+                                        discussion: disc,
+                                        course_id: forum.course,
+                                        course_name: course_name.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    let _ = tx.send(AppMsg::AnnouncementsLoaded(all_ann));
+                }
+                Err(e) => eprintln!("forums fetch: {e}"),
+            }
+        });
     }
 
     fn fetch_assignments(&self) {
@@ -173,6 +243,18 @@ impl App {
             match client.assignments(&ids).await {
                 Ok(r) => { let _ = tx.send(AppMsg::AssignmentsLoaded(r)); }
                 Err(e) => eprintln!("assignments: {e}"),
+            }
+        });
+    }
+
+    fn fetch_assignment_status(&self, assign_id: u64) {
+        let token = self.token.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let client = MoodleClient::new(token);
+            match client.submission_status(assign_id).await {
+                Ok(status) => { let _ = tx.send(AppMsg::AssignmentStatusLoaded { assign_id, status }); }
+                Err(e) => eprintln!("submission status {assign_id}: {e}"),
             }
         });
     }
@@ -243,6 +325,18 @@ impl App {
         });
     }
 
+    fn fetch_course_content(&self, course_id: u64) {
+        let token = self.token.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let client = MoodleClient::new(token);
+            match client.course_contents(course_id).await {
+                Ok(sections) => { let _ = tx.send(AppMsg::CourseContentLoaded { course_id, sections }); }
+                Err(e) => eprintln!("course content {course_id}: {e}"),
+            }
+        });
+    }
+
     fn flush_course_timer(&mut self) {
         if let (Some(id), Some(since)) = (self.focused_course, self.focus_since.take()) {
             let secs = since.elapsed().as_secs();
@@ -264,8 +358,18 @@ impl App {
                 if let Ok(m) = self.storage.get_course_metrics(id) {
                     self.courses.metrics.insert(id, m);
                 }
+                
+                // Load course content
+                self.course_content.course_id = id;
+                self.course_content.sections.clear();
+                self.course_content.loading = true;
+                self.fetch_course_content(id);
             }
-            CoursesEvent::Deselected => self.flush_course_timer(),
+            CoursesEvent::Deselected => {
+                self.flush_course_timer();
+                self.course_content.course_id = 0;
+                self.course_content.sections.clear();
+            }
         }
     }
 
@@ -273,6 +377,7 @@ impl App {
         self.flush_course_timer();
         self.storage.clear_session().ok();
         self.token.clear();
+        self.private_token.clear();
         self.userid = 0;
         self.fullname.clear();
         self.student_year = None;
@@ -317,6 +422,10 @@ impl App {
                         }
                         self.active_tab = tab;
                         match tab {
+                            Tab::Announcements if !self.announcements_loaded => {
+                                self.announcements_loaded = true;
+                                self.fetch_announcements();
+                            }
                             Tab::Assignments if !self.assignments_loaded => {
                                 self.assignments_loaded = true;
                                 self.fetch_assignments();
@@ -347,9 +456,10 @@ impl App {
                     if ui.button(egui::RichText::new("Logout").size(13.0)).clicked() {
                         self.do_logout();
                     }
-                    if ui.button(egui::RichText::new("⚙").size(14.0)).clicked() {
+                    if ui.button(egui::RichText::new(egui_phosphor::regular::GEAR).size(16.0)).clicked() {
                         self.show_settings = !self.show_settings;
                     }
+
                     ui.separator();
                     if let Some(year) = self.student_year {
                         ui.label(egui::RichText::new(year_label(year)).size(12.0)
@@ -411,8 +521,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                AppMsg::LoginOk { token, info } => {
+                AppMsg::LoginOk { token, private_token, info } => {
                     self.storage.set("token", &token).ok();
+                    self.storage.set("private_token", &private_token).ok();
                     self.storage.set("userid", &info.userid.to_string()).ok();
                     self.storage.set("fullname", &info.fullname).ok();
                     self.storage.set("username", &self.login.username).ok();
@@ -424,6 +535,7 @@ impl eframe::App for App {
                         }
                     });
                     self.token = token.clone();
+                    self.private_token = private_token.clone();
                     self.userid = info.userid;
                     self.fullname = info.fullname;
                     self.login.loading = false;
@@ -469,8 +581,24 @@ impl eframe::App for App {
                     self.apply_year_defaults();
                     ctx.request_repaint();
                 }
+                AppMsg::CourseContentLoaded { course_id, sections } => {
+                    if self.course_content.course_id == course_id {
+                        self.course_content.sections = sections;
+                        self.course_content.loading = false;
+                    }
+                    ctx.request_repaint();
+                }
+                AppMsg::AnnouncementsLoaded(ann) => {
+                    self.announcements.announcements = ann;
+                    ctx.request_repaint();
+                }
                 AppMsg::AssignmentsLoaded(r) => {
                     self.assignments.courses = r.courses;
+                    ctx.request_repaint();
+                }
+                AppMsg::AssignmentStatusLoaded { assign_id, status } => {
+                    self.assignments.loading_statuses.remove(&assign_id);
+                    self.assignments.submission_statuses.insert(assign_id, status);
                     ctx.request_repaint();
                 }
                 AppMsg::CalendarLoaded(r) => {
@@ -510,9 +638,28 @@ impl eframe::App for App {
                     self.profile.student_year = self.student_year;
                     ctx.request_repaint();
                 }
-                AppMsg::TokenExpired => { self.do_logout(); ctx.request_repaint(); }
+                AppMsg::OpenUrl(url) => {
+                    let private_token = self.private_token.clone();
+                    let token = self.token.clone();
+                    tokio::spawn(async move {
+                        let mut target_url = url.clone();
+                        if !private_token.is_empty() {
+                            let client = MoodleClient::new(token);
+                            if let Ok(resp) = client.get_autologin_url(&private_token).await {
+                                let encoded = url.replace('%', "%25").replace('&', "%26").replace('?', "%3F").replace('=', "%3D");
+                                target_url = format!("{}&url={}", resp.autologinurl, encoded);
+                            }
+                        }
+                        // Fallback to default browser
+                        let _ = open::that(&target_url);
+                    });
+                }
                 AppMsg::NewNotifications(count) => {
                     self.notifications.unread_count += count;
+                    ctx.request_repaint();
+                }
+                AppMsg::TokenExpired => {
+                    self.do_logout();
                     ctx.request_repaint();
                 }
             }
@@ -523,13 +670,13 @@ impl eframe::App for App {
             egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let now = chrono::Utc::now().timestamp();
-                    ui.colored_label(egui::Color32::from_rgb(80, 200, 80), "● Online");
+                    ui.colored_label(egui::Color32::from_rgb(80, 200, 80), format!("{} Online", egui_phosphor::regular::CHECK_CIRCLE));
                     ui.separator();
 
                     if self.notifications.unread_count > 0 {
                         ui.colored_label(
                             egui::Color32::from_rgb(255, 180, 50),
-                            format!("🔔 {} unread", self.notifications.unread_count),
+                            format!("{} {} unread", egui_phosphor::regular::BELL, self.notifications.unread_count),
                         );
                         ui.separator();
                     }
@@ -539,7 +686,7 @@ impl eframe::App for App {
                         .filter(|a| a.duedate > now)
                         .collect();
                     if !upcoming.is_empty() {
-                        ui.label(egui::RichText::new(format!("📄 {} upcoming", upcoming.len()))
+                        ui.label(egui::RichText::new(format!("{} {} upcoming", egui_phosphor::regular::FILE_TEXT, upcoming.len()))
                             .size(12.0).color(ui.visuals().weak_text_color()));
                         ui.separator();
                     }
@@ -561,7 +708,7 @@ impl eframe::App for App {
                             ui.visuals().weak_text_color()
                         };
                         let short: String = next.name.chars().take(30).collect();
-                        ui.label(egui::RichText::new(format!("⏰ Next: {short} — {time_str}"))
+                        ui.label(egui::RichText::new(format!("{} Next: {} — {}", egui_phosphor::regular::CLOCK, short, time_str))
                             .size(12.0).color(color));
                     }
 
@@ -586,7 +733,7 @@ impl eframe::App for App {
                         self.login.error = None;
                         tokio::spawn(async move {
                             match MoodleClient::login(&username, &password).await {
-                                Ok((token, info)) => { let _ = tx.send(AppMsg::LoginOk { token, info }); }
+                                Ok((token, private_token, info)) => { let _ = tx.send(AppMsg::LoginOk { token, private_token, info }); }
                                 Err(e) => { let _ = tx.send(AppMsg::LoginErr(e.to_string())); }
                             }
                         });
@@ -599,11 +746,53 @@ impl eframe::App for App {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     match self.active_tab {
                         Tab::Courses => {
-                            if let Some(ev) = self.courses.show(ui) { self.on_course_event(ev); }
+                            if let Some(selected_id) = self.courses.selected_course {
+                                let name = self.courses.courses.iter()
+                                    .find(|c| c.id == selected_id)
+                                    .map(|c| c.fullname.clone())
+                                    .unwrap_or_else(|| "Course".into());
+                                
+                                egui::TopBottomPanel::top("course_content_top").show_inside(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("⬅ Back").clicked() {
+                                            self.on_course_event(CoursesEvent::Deselected);
+                                            self.courses.selected_course = None;
+                                        }
+                                        ui.label(egui::RichText::new(decode_html(&name)).size(16.0).strong());
+                                    });
+                                });
+                                egui::CentralPanel::default().show_inside(ui, |ui| {
+                                    if let Some(url) = self.course_content.show(ui) {
+                                        let _ = self.tx.send(AppMsg::OpenUrl(url));
+                                    }
+                                });
+                            } else {
+                                if let Some(ev) = self.courses.show(ui) { self.on_course_event(ev); }
+                            }
                         }
-                        Tab::Assignments  => self.assignments.show(ui),
-                        Tab::Calendar     => self.calendar.show(ui),
-                        Tab::Notifications => self.notifications.show(ui),
+                        Tab::Announcements => { self.announcements.show(ui); }
+                        Tab::Assignments  => {
+                            use crate::screens::assignments::AssignmentsEvent;
+                            if let Some(ev) = self.assignments.show(ui) {
+                                match ev {
+                                    AssignmentsEvent::RequestStatus(id) => {
+                                        self.assignments.loading_statuses.insert(id);
+                                        self.fetch_assignment_status(id);
+                                    }
+                                }
+                            }
+                        }
+                        Tab::Calendar     => {
+                            use crate::screens::calendar::CalendarScreenEvent;
+                            if let Some(ev) = self.calendar.show(ui) {
+                                match ev {
+                                    CalendarScreenEvent::DeletePersonal(id) => {
+                                        self.calendar.personal_events.retain(|e| e.id != id);
+                                    }
+                                }
+                            }
+                        }
+                        Tab::Notifications => { self.notifications.show(ui); }
                         Tab::Grades => {
                             if let Some(cid) = self.grades.show(ui) {
                                 if !self.grades.detail_loading.contains(&cid) {
@@ -612,7 +801,7 @@ impl eframe::App for App {
                                 }
                             }
                         }
-                        Tab::Profile => self.profile.show(ui),
+                        Tab::Profile => { self.profile.show(ui); }
                     }
                 });
             }

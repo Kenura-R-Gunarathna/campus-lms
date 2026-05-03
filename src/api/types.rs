@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use serde::Deserialize;
 
 fn de_false_as_none<'de, D>(d: D) -> Result<Option<String>, D::Error>
@@ -23,6 +24,7 @@ where D: serde::Deserializer<'de> {
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub token: Option<String>,
+    pub privatetoken: Option<String>,
     pub error: Option<String>,
 }
 
@@ -32,6 +34,12 @@ pub struct SiteInfo {
     pub fullname: String,
     pub sitename: String,
     pub errorcode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AutoLoginResponse {
+    pub key: String,
+    pub autologinurl: String,
 }
 
 // ── Courses ──────────────────────────────────────────────────────────────────
@@ -47,6 +55,37 @@ pub struct Course {
     pub categoryname: String,
     #[serde(default)]
     pub summary: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CourseSection {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub modules: Vec<CourseModule>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CourseModule {
+    pub id: u64,
+    pub name: String,
+    pub modname: String,
+    #[serde(deserialize_with = "de_false_as_none", default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub contents: Vec<ModuleContent>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModuleContent {
+    pub filename: String,
+    pub fileurl: String,
+    pub filesize: u64,
+    pub mimetype: Option<String>,
 }
 
 // ── Assignments ──────────────────────────────────────────────────────────────
@@ -76,6 +115,54 @@ pub struct Assignment {
     pub cutoffdate: i64,
     #[serde(deserialize_with = "de_false_as_none", default)]
     pub intro: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubmissionStatusResponse {
+    pub lastattempt: Option<LastAttempt>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LastAttempt {
+    pub submission: Option<Submission>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Submission {
+    pub id: u64,
+    pub status: String, // "new", "draft", "submitted"
+    pub timemodified: i64,
+}
+
+// ── Forums / Announcements ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Forum {
+    pub id: u64,
+    pub course: u64,
+    #[serde(rename = "type")]
+    pub forum_type: String, // "news", "general", etc.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ForumDiscussionsResponse {
+    pub discussions: Vec<ForumDiscussion>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ForumDiscussion {
+    pub id: u64,
+    pub name: String,
+    pub message: String,
+    pub userfullname: String,
+    pub usermodifiedfullname: String,
+    pub timecreated: i64,
+    pub timemodified: i64,
+    pub numreplies: u32,
+    pub pinned: bool,
+    pub subject: String,
+    pub messageformat: u32,
 }
 
 // ── Calendar ─────────────────────────────────────────────────────────────────

@@ -128,7 +128,7 @@ impl GradesScreen {
                         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                         .show(ui, |ui| {
                             let resp = ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(if is_expanded { "▼" } else { "▶" })
+                                ui.label(egui::RichText::new(if is_expanded { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT })
                                     .size(11.0).color(ui.visuals().weak_text_color()));
                                 ui.label(egui::RichText::new(fullname).size(15.0));
 

@@ -1,16 +1,7 @@
 use egui::Ui;
 use std::collections::BTreeSet;
 use crate::api::types::Course;
-use crate::models::{parse_dept, parse_year, year_label};
-
-fn decode_html(s: &str) -> String {
-    s.replace("&amp;", "&")
-     .replace("&lt;", "<")
-     .replace("&gt;", ">")
-     .replace("&quot;", "\"")
-     .replace("&#39;", "'")
-     .replace("&nbsp;", " ")
-}
+use crate::models::{decode_html, parse_dept, parse_year, year_label};
 
 fn fmt_duration(secs: u64) -> String {
     if secs < 60 { return format!("{secs}s"); }

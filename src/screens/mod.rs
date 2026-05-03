@@ -1,6 +1,8 @@
 pub mod assignments;
 pub mod calendar;
 pub mod courses;
+pub mod course_content;
+pub mod announcements;
 pub mod grades;
 pub mod login;
 pub mod notifications;

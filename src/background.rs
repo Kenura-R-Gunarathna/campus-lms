@@ -66,7 +66,8 @@ async fn count_new_notifs(token: &str, userid: u64, last_id: u64) -> Option<(u64
 
 /// Poll used in daemon mode where Storage can be held (not spawned)
 async fn poll_once(token: &str, userid: u64, last_id: u64, storage: Option<&Storage>) -> u64 {
-    if let Some(Some((count, newest))) = Some(count_new_notifs(token, userid, last_id).await) {
+    if let Some(Some((_count, newest))) = Some(count_new_notifs(token, userid, last_id).await) {
+
         if let Some(s) = storage { s.set("last_notif_id", &newest.to_string()).ok(); }
         return newest;
     }
