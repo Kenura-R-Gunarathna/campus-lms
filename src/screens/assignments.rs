@@ -21,6 +21,7 @@ impl StatusFilter {
 
 pub enum AssignmentsEvent {
     RequestStatus(u64),
+    OpenDetail { assign: Assignment, course_name: String },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -340,7 +341,15 @@ impl AssignmentsScreen {
                                         });
                                 }
 
-                                ui.label(egui::RichText::new(&assign.name).size(15.0));
+                                let name_resp = ui.selectable_label(false,
+                                    egui::RichText::new(&assign.name).size(15.0)
+                                        .color(egui::Color32::from_rgb(120, 180, 255)));
+                                if name_resp.clicked() {
+                                    event = Some(AssignmentsEvent::OpenDetail {
+                                        assign: assign.clone(),
+                                        course_name: course.fullname.clone(),
+                                    });
+                                }
                                 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if !is_submitted && status.is_none() {

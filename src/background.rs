@@ -1,7 +1,8 @@
 use crate::api::MoodleClient;
 use crate::storage::Storage;
 
-const POLL_SECS: u64 = 600;
+const NOTIF_POLL_SECS: u64 = 600;   // 10 min
+const CONTENT_POLL_SECS: u64 = 1800; // 30 min
 
 fn desktop_notify(title: &str, body: &str) {
     let _ = notify_rust::Notification::new()
@@ -24,20 +25,32 @@ pub async fn run_daemon() {
     if token.is_empty() || userid == 0 {
         eprintln!("No session. Log in via GUI first."); return;
     }
-    let mut last_id: u64 = storage.get("last_notif_id").ok().flatten()
+
+    let mut last_notif_id: u64 = storage.get("last_notif_id").ok().flatten()
         .and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut last_content_poll: std::time::Instant =
+        std::time::Instant::now() - std::time::Duration::from_secs(CONTENT_POLL_SECS);
+
     loop {
-        last_id = poll_once(&token, userid, last_id, Some(&storage)).await;
-        tokio::time::sleep(tokio::time::Duration::from_secs(POLL_SECS)).await;
+        // Notifications
+        last_notif_id = poll_notifications(&token, userid, last_notif_id, &storage).await;
+
+        // Course content changes (every 30 min)
+        if last_content_poll.elapsed().as_secs() >= CONTENT_POLL_SECS {
+            poll_content_changes(&token, &storage).await;
+            last_content_poll = std::time::Instant::now();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(NOTIF_POLL_SECS)).await;
     }
 }
 
-/// In-app background poller (tokio task — no Storage held across awaits)
+/// In-app background poller (tokio task)
 pub fn spawn_poller(token: String, userid: u64, tx: std::sync::mpsc::Sender<u64>) {
     tokio::spawn(async move {
         let mut last_id: u64 = 0;
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(POLL_SECS)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(NOTIF_POLL_SECS)).await;
             let new_count = count_new_notifs(&token, userid, last_id).await;
             if let Some((count, newest_id)) = new_count {
                 last_id = newest_id;
@@ -47,14 +60,12 @@ pub fn spawn_poller(token: String, userid: u64, tx: std::sync::mpsc::Sender<u64>
     });
 }
 
-/// Poll without holding any non-Send type across awaits
 async fn count_new_notifs(token: &str, userid: u64, last_id: u64) -> Option<(u64, u64)> {
     let client = MoodleClient::new(token.to_string());
     let notifs = client.notifications(userid, 0).await.ok()?;
     let new: Vec<_> = notifs.notifications.iter()
         .filter(|n| n.id > last_id && !n.is_read).collect();
     let newest_id = notifs.notifications.iter().map(|n| n.id).max().unwrap_or(last_id);
-    // Send desktop notifications (blocking call, moved off async thread)
     let subjects: Vec<String> = new.iter().take(3).map(|n| n.subject.clone()).collect();
     let extra = new.len().saturating_sub(3);
     tokio::task::spawn_blocking(move || {
@@ -64,14 +75,66 @@ async fn count_new_notifs(token: &str, userid: u64, last_id: u64) -> Option<(u64
     Some((new.len() as u64, newest_id))
 }
 
-/// Poll used in daemon mode where Storage can be held (not spawned)
-async fn poll_once(token: &str, userid: u64, last_id: u64, storage: Option<&Storage>) -> u64 {
-    if let Some(Some((_count, newest))) = Some(count_new_notifs(token, userid, last_id).await) {
-
-        if let Some(s) = storage { s.set("last_notif_id", &newest.to_string()).ok(); }
+async fn poll_notifications(token: &str, userid: u64, last_id: u64, storage: &Storage) -> u64 {
+    if let Some((_count, newest)) = count_new_notifs(token, userid, last_id).await {
+        storage.set("last_notif_id", &newest.to_string()).ok();
         return newest;
     }
     last_id
+}
+
+/// Poll enrolled courses for content changes, send desktop notification if changes found.
+async fn poll_content_changes(token: &str, storage: &Storage) {
+    // Load enrolled courses from cache
+    let courses_json = match storage.load_cache("courses") {
+        Ok(Some(j)) => j,
+        _ => return,
+    };
+    let courses: Vec<crate::api::types::Course> = match serde_json::from_str(&courses_json) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let client = MoodleClient::new(token.to_string());
+    let mut changed_courses: Vec<String> = vec![];
+    let mut total_changes = 0usize;
+
+    for course in &courses {
+        let sections = match client.course_contents(course.id).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let stored = match storage.load_fingerprints(course.id) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let (changes, new_fps, removed_ids) = crate::telemetry::diff_content(course.id, &sections, &stored);
+
+        if !changes.is_empty() {
+            total_changes += changes.len();
+            changed_courses.push(course.shortname.clone());
+            let _ = storage.save_changes(&changes);
+        }
+
+        let _ = storage.upsert_fingerprints(course.id, &new_fps);
+        let _ = storage.delete_fingerprints(&removed_ids);
+
+        // Small delay to avoid hammering the server
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    if !changed_courses.is_empty() {
+        let course_list = changed_courses.join(", ");
+        let body = format!(
+            "{total_changes} change{} in: {course_list}",
+            if total_changes == 1 { "" } else { "s" }
+        );
+        tokio::task::spawn_blocking(move || {
+            desktop_notify("Campus LMS — Content Updated", &body);
+        }).await.ok();
+    }
 }
 
 pub fn create_autostart() -> std::io::Result<()> {

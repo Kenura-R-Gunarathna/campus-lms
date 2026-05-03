@@ -1,3 +1,4 @@
+pub mod assignment_detail;
 pub mod assignments;
 pub mod calendar;
 pub mod courses;

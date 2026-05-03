@@ -19,6 +19,24 @@ where D: serde::Deserializer<'de> {
     })
 }
 
+fn de_false_as_zero_u64<'de, D>(d: D) -> Result<u64, D::Error>
+where D: serde::Deserializer<'de> {
+    let v: serde_json::Value = Deserialize::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+        _ => 0,
+    })
+}
+
+fn de_false_as_empty<'de, D>(d: D) -> Result<String, D::Error>
+where D: serde::Deserializer<'de> {
+    let v: serde_json::Value = Deserialize::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
 // ── Auth ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -74,7 +92,7 @@ pub struct CourseModule {
     pub modname: String,
     #[serde(deserialize_with = "de_false_as_none", default)]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "de_false_as_none", default)]
     pub url: Option<String>,
     #[serde(default)]
     pub contents: Vec<ModuleContent>,
@@ -85,9 +103,13 @@ pub struct CourseModule {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModuleContent {
+    #[serde(deserialize_with = "de_false_as_empty", default)]
     pub filename: String,
+    #[serde(deserialize_with = "de_false_as_empty", default)]
     pub fileurl: String,
+    #[serde(deserialize_with = "de_false_as_zero_u64", default)]
     pub filesize: u64,
+    #[serde(deserialize_with = "de_false_as_none", default)]
     pub mimetype: Option<String>,
 }
 
@@ -120,6 +142,14 @@ pub struct Assignment {
     pub intro: Option<String>,
 }
 
+impl Assignment {
+    pub fn url(&self) -> Option<String> {
+        if self.cmid == 0 { None } else {
+            Some(format!("https://sci.cmb.ac.lk/lms/mod/assign/view.php?id={}", self.cmid))
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct SubmissionStatusResponse {
     pub lastattempt: Option<LastAttempt>,
@@ -128,6 +158,12 @@ pub struct SubmissionStatusResponse {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LastAttempt {
     pub submission: Option<Submission>,
+    #[serde(default)]
+    pub gradingstatus: String, // "notgraded", "graded"
+    #[serde(default)]
+    pub submissionsenabled: bool,
+    #[serde(default)]
+    pub canedit: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -135,6 +171,43 @@ pub struct Submission {
     pub id: u64,
     pub status: String, // "new", "draft", "submitted"
     pub timemodified: i64,
+    #[serde(default)]
+    pub plugins: Vec<SubmissionPlugin>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubmissionPlugin {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub fileareas: Vec<SubmissionFileArea>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubmissionFileArea {
+    #[serde(default)]
+    pub area: String,
+    #[serde(default)]
+    pub files: Vec<SubmissionFile>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubmissionFile {
+    #[serde(deserialize_with = "de_false_as_empty", default)]
+    pub filename: String,
+    #[serde(deserialize_with = "de_false_as_empty", default)]
+    pub fileurl: String,
+    #[serde(deserialize_with = "de_false_as_zero_u64", default)]
+    pub filesize: u64,
+    #[serde(default)]
+    pub timemodified: i64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FileUploadResponse {
+    pub itemid: u64,
+    #[serde(default)]
+    pub filename: String,
 }
 
 // ── Forums / Announcements ──────────────────────────────────────────────────

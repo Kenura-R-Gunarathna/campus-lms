@@ -68,13 +68,31 @@ impl MoodleClient {
     }
 
     pub async fn course_contents(&self, course_id: u64) -> anyhow::Result<Vec<CourseSection>> {
+        // Try with returncontents=1; fall back silently if the course doesn't support it
+        match self.fetch_sections(course_id, true).await {
+            Err(e) if is_returncontents_error(&e) => self.fetch_sections(course_id, false).await,
+            other => other,
+        }
+    }
+
+    async fn fetch_sections(&self, course_id: u64, with_contents: bool) -> anyhow::Result<Vec<CourseSection>> {
         let mut p = self.base_params("core_course_get_contents");
         p.push(("courseid".into(), course_id.to_string()));
-        // Return full page HTML content so "page" modules can be shown inline
-        p.push(("options[0][name]".into(), "returncontents".into()));
-        p.push(("options[0][value]".into(), "1".into()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
-            .query(&p).send().await?.json().await?)
+        if with_contents {
+            p.push(("options[0][name]".into(), "returncontents".into()));
+            p.push(("options[0][value]".into(), "1".into()));
+        }
+        let text = self.http.get(format!("{BASE}/webservice/rest/server.php"))
+            .query(&p).send().await?.text().await?;
+        if text.trim_start().starts_with('{') {
+            let v: serde_json::Value = serde_json::from_str(&text)?;
+            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            anyhow::bail!("API:{msg}");
+        }
+        serde_json::from_str::<Vec<CourseSection>>(&text).map_err(|e| {
+            let snippet: String = text.chars().take(500).collect();
+            anyhow::anyhow!("decode: {e} | {snippet}")
+        })
     }
 
     pub async fn assignments(&self, course_ids: &[u64]) -> anyhow::Result<AssignmentsResponse> {
@@ -91,6 +109,53 @@ impl MoodleClient {
         p.push(("assignid".into(), assign_id.to_string()));
         Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
             .query(&p).send().await?.json().await?)
+    }
+
+    /// Upload a file to the user's draft area. Returns the draft itemid.
+    pub async fn upload_file(&self, filename: &str, data: Vec<u8>) -> anyhow::Result<FileUploadResponse> {
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")?;
+        let form = reqwest::multipart::Form::new()
+            .text("token", self.token.clone())
+            .text("filearea", "draft")
+            .text("itemid", "0")
+            .text("filepath", "/")
+            .text("filename", filename.to_string())
+            .part("file_1", part);
+        let resp: serde_json::Value = self.http
+            .post(format!("{BASE}/webservice/upload.php"))
+            .multipart(form)
+            .send().await?.json().await?;
+        // API returns an array with one item
+        let item = resp.get(0).or_else(|| Some(&resp))
+            .ok_or_else(|| anyhow::anyhow!("empty upload response"))?;
+        Ok(FileUploadResponse {
+            itemid: item.get("itemid").and_then(|v| v.as_u64()).unwrap_or(0),
+            filename: item.get("filename").and_then(|v| v.as_str()).unwrap_or(filename).to_string(),
+        })
+    }
+
+    /// Save a file submission for an assignment using a draft itemid.
+    pub async fn save_submission(&self, assign_id: u64, itemid: u64) -> anyhow::Result<()> {
+        let mut p = self.base_params("mod_assign_save_submission");
+        p.push(("assignmentid".into(), assign_id.to_string()));
+        p.push(("plugindata[files_filemanager]".into(), itemid.to_string()));
+        let _: serde_json::Value = self.http
+            .post(format!("{BASE}/webservice/rest/server.php"))
+            .form(&p).send().await?.json().await?;
+        Ok(())
+    }
+
+    /// Submit the saved draft for grading.
+    pub async fn submit_for_grading(&self, assign_id: u64) -> anyhow::Result<()> {
+        let mut p = self.base_params("mod_assign_submit_for_grading");
+        p.push(("assignmentid".into(), assign_id.to_string()));
+        p.push(("acceptsubmissionstatement".into(), "1".into()));
+        let _: serde_json::Value = self.http
+            .post(format!("{BASE}/webservice/rest/server.php"))
+            .form(&p).send().await?.json().await?;
+        Ok(())
     }
 
     pub async fn forums_by_courses(&self, course_ids: &[u64]) -> anyhow::Result<Vec<Forum>> {
@@ -157,4 +222,9 @@ impl MoodleClient {
 pub fn is_token_error(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("token_invalid") || s.contains("invalidtoken") || s.contains("Invalid token")
+}
+
+fn is_returncontents_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("returncontents") || s.contains("param") && s.contains("invalid")
 }

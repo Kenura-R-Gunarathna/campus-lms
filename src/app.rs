@@ -6,6 +6,7 @@ use crate::background;
 use crate::models::{decode_html, infer_student_year, parse_dept, year_label};
 use crate::screens::{
     announcements::{Announcement, AnnouncementsScreen},
+    assignment_detail::{AssignmentDetailScreen, AssignmentDetailEvent, UploadState},
     assignments::AssignmentsScreen,
     calendar::CalendarScreen,
     courses::{CoursesEvent, CoursesScreen},
@@ -15,7 +16,7 @@ use crate::screens::{
     notifications::NotificationsScreen,
     profile::ProfileScreen,
 };
-use crate::storage::Storage;
+use crate::storage::{Storage, ActivityEntry};
 
 const KEYRING_SERVICE: &str = "campus-lms";
 
@@ -60,7 +61,11 @@ enum AppMsg {
     OpenUrl(String),
     FileDownloaded { module_id: u64, path: PathBuf },
     FileDownloadFailed { module_id: u64, error: String },
+    FilePicked { assign_id: u64, filename: String, data: Vec<u8> },
+    AssignmentUploadDone { assign_id: u64 },
+    AssignmentUploadFailed { assign_id: u64, error: String },
 }
+
 
 pub struct App {
     screen: Screen,
@@ -70,6 +75,7 @@ pub struct App {
     course_content: CourseContentScreen,
     announcements: AnnouncementsScreen,
     assignments: AssignmentsScreen,
+    assignment_detail: AssignmentDetailScreen,
     calendar: CalendarScreen,
     notifications: NotificationsScreen,
     grades: GradesScreen,
@@ -117,6 +123,7 @@ impl App {
             course_content: CourseContentScreen::default(),
             announcements: AnnouncementsScreen::default(),
             assignments: AssignmentsScreen::default(),
+            assignment_detail: AssignmentDetailScreen::default(),
             calendar: CalendarScreen::default(),
             notifications: NotificationsScreen::default(),
             grades: GradesScreen::default(),
@@ -152,6 +159,14 @@ impl App {
                 app.userid = userid;
                 app.fullname = app.storage.get("fullname").ok().flatten().unwrap_or_default();
                 app.screen = Screen::Main;
+
+                // Load unseen change counts + recent activity
+                if let Ok(counts) = app.storage.unseen_change_counts() {
+                    app.courses.change_counts = counts;
+                }
+                if let Ok(ra) = app.storage.recent_activity(5) {
+                    app.courses.recent_activity = ra;
+                }
 
                 // Pre-populate from cache (stale-while-revalidate)
                 if let Ok(Some(json)) = app.storage.load_cache("courses") {
@@ -295,6 +310,44 @@ impl App {
         });
     }
 
+    fn pick_file_for_assignment(&self, assign_id: u64) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                rfd::FileDialog::new().pick_file().and_then(|path| {
+                    let filename = path.file_name()?.to_string_lossy().into_owned();
+                    let data = std::fs::read(&path).ok()?;
+                    Some((filename, data))
+                })
+            }).await;
+            if let Ok(Some((filename, data))) = result {
+                let _ = tx.send(AppMsg::FilePicked { assign_id, filename, data });
+            }
+        });
+    }
+
+    fn upload_and_submit(&self, assign_id: u64, filename: String, data: Vec<u8>) {
+        let token = self.token.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let client = MoodleClient::new(token);
+            let upload = client.upload_file(&filename, data).await;
+            match upload {
+                Err(e) => { let _ = tx.send(AppMsg::AssignmentUploadFailed { assign_id, error: e.to_string() }); }
+                Ok(resp) => {
+                    if let Err(e) = client.save_submission(assign_id, resp.itemid).await {
+                        let _ = tx.send(AppMsg::AssignmentUploadFailed { assign_id, error: e.to_string() });
+                        return;
+                    }
+                    match client.submit_for_grading(assign_id).await {
+                        Ok(()) => { let _ = tx.send(AppMsg::AssignmentUploadDone { assign_id }); }
+                        Err(e) => { let _ = tx.send(AppMsg::AssignmentUploadFailed { assign_id, error: e.to_string() }); }
+                    }
+                }
+            }
+        });
+    }
+
     fn fetch_calendar(&self) {
         let token = self.token.clone();
         let tx = self.tx.clone();
@@ -373,6 +426,39 @@ impl App {
         });
     }
 
+    fn find_module_info(&self, module_id: u64) -> Option<(String, String)> {
+        for section in &self.course_content.sections {
+            for module in &section.modules {
+                if module.id == module_id {
+                    return Some((module.name.clone(), section.name.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn record_activity(&mut self, module_id: u64, action: &str) {
+        if let Some((module_name, section_name)) = self.find_module_info(module_id) {
+            let course_name = self.courses.courses.iter()
+                .find(|c| c.id == self.course_content.course_id)
+                .map(|c| c.shortname.clone())
+                .unwrap_or_default();
+            let entry = ActivityEntry {
+                course_id: self.course_content.course_id,
+                course_name,
+                module_id,
+                module_name,
+                section_name,
+                action: action.to_string(),
+                timestamp: chrono::Utc::now().timestamp(),
+            };
+            let _ = self.storage.record_activity(&entry);
+            if let Ok(ra) = self.storage.recent_activity(5) {
+                self.courses.recent_activity = ra;
+            }
+        }
+    }
+
     fn download_file(&self, module_id: u64, url: String, save_path: PathBuf) {
         let token = self.token.clone();
         let tx = self.tx.clone();
@@ -426,6 +512,13 @@ impl App {
                 self.course_content.loading = true;
                 self.course_content.needs_scroll = true;
                 self.course_content.download_states.clear();
+                // Load recent changes for What's New panel, then mark seen
+                if let Ok(rc) = self.storage.recent_changes(id, 20) {
+                    self.course_content.recent_changes = rc;
+                    self.course_content.show_changes = !self.course_content.recent_changes.is_empty();
+                }
+                let _ = self.storage.mark_changes_seen(id);
+                self.courses.change_counts.remove(&id);
                 // Load from cache first (stale-while-revalidate)
                 if let Ok(Some(json)) = self.storage.load_cache(&format!("course_content_{id}")) {
                     if let Ok(v) = serde_json::from_str::<Vec<crate::api::types::CourseSection>>(&json) {
@@ -447,6 +540,7 @@ impl App {
         self.flush_course_timer();
         self.storage.clear_session().ok();
         self.storage.clear_cache().ok();
+        self.storage.clear_telemetry().ok();
         self.token.clear();
         self.private_token.clear();
         self.userid = 0;
@@ -454,6 +548,7 @@ impl App {
         self.student_year = None;
         self.courses = CoursesScreen::default();
         self.assignments = AssignmentsScreen::default();
+        self.assignment_detail = AssignmentDetailScreen::default();
         self.calendar = CalendarScreen::default();
         self.notifications = NotificationsScreen::default();
         self.grades = GradesScreen::default();
@@ -579,8 +674,9 @@ impl App {
                 }
 
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("When enabled, Campus LMS starts in background on login and sends desktop notifications for new activity.").size(11.0)
-                    .color(ui.visuals().weak_text_color()));
+                ui.label(egui::RichText::new(
+                    "Polls notifications every 10 min and course content changes every 30 min. Sends desktop notifications for new activity and updated course materials.")
+                    .size(11.0).color(ui.visuals().weak_text_color()));
 
                 ui.add_space(10.0);
                 if ui.button("Close").clicked() { self.show_settings = false; }
@@ -656,6 +752,29 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 AppMsg::CourseContentLoaded { course_id, sections } => {
+                    // Diff against fingerprints to detect changes
+                    if let Ok(stored) = self.storage.load_fingerprints(course_id) {
+                        let (changes, new_fps, removed_ids) = crate::telemetry::diff_content(course_id, &sections, &stored);
+                        if !changes.is_empty() {
+                            let _ = self.storage.save_changes(&changes);
+                            if let Ok(counts) = self.storage.unseen_change_counts() {
+                                self.courses.change_counts = counts;
+                            }
+                            // If currently viewing this course, refresh What's New panel
+                            if self.course_content.course_id == course_id {
+                                if let Ok(rc) = self.storage.recent_changes(course_id, 20) {
+                                    self.course_content.recent_changes = rc;
+                                    self.course_content.show_changes = true;
+                                }
+                                // Re-mark seen since user is actively looking at it
+                                let _ = self.storage.mark_changes_seen(course_id);
+                                self.courses.change_counts.remove(&course_id);
+                            }
+                        }
+                        let _ = self.storage.upsert_fingerprints(course_id, &new_fps);
+                        let _ = self.storage.delete_fingerprints(&removed_ids);
+                    }
+
                     if self.course_content.course_id == course_id {
                         if let Ok(json) = serde_json::to_string(&sections) {
                             let _ = self.storage.save_cache(&format!("course_content_{course_id}"), &json);
@@ -708,6 +827,10 @@ impl eframe::App for App {
                 }
                 AppMsg::AssignmentStatusLoaded { assign_id, status } => {
                     self.assignments.loading_statuses.remove(&assign_id);
+                    if self.assignment_detail.assignment.as_ref().map(|a| a.id) == Some(assign_id) {
+                        self.assignment_detail.status = Some(status.clone());
+                        self.assignment_detail.loading_status = false;
+                    }
                     self.assignments.submission_statuses.insert(assign_id, status);
                     ctx.request_repaint();
                 }
@@ -786,19 +909,14 @@ impl eframe::App for App {
                             eprintln!("autologin API failed, using wantsurl fallback");
                         }
 
-                        // Fallback: wantsurl redirect — if browser has valid Moodle session it
-                        // goes directly to the page; if not, shows login then redirects there.
-                        const BASE: &str = "https://sci.cmb.ac.lk/lms";
-                        if url.starts_with(BASE) {
-                            let _ = open::that(
-                                format!("{BASE}/login/index.php?wantsurl={}", pct_encode(&url)));
-                        } else {
-                            let _ = open::that(&url);
-                        }
+                        // Open directly — Moodle redirects to login+back automatically when
+                        // session is missing. wantsurl causes "already logged in" confirm dialog.
+                        let _ = open::that(&url);
                     });
                 }
                 AppMsg::FileDownloaded { module_id, path } => {
                     self.course_content.download_states.insert(module_id, DownloadState::Done(path.clone()));
+                    self.record_activity(module_id, "downloaded");
                     let _ = open::that(&path);
                     ctx.request_repaint();
                 }
@@ -808,6 +926,29 @@ impl eframe::App for App {
                 }
                 AppMsg::NewNotifications(count) => {
                     self.notifications.unread_count += count;
+                    ctx.request_repaint();
+                }
+                AppMsg::FilePicked { assign_id, filename, data } => {
+                    if self.assignment_detail.assignment.as_ref().map(|a| a.id) == Some(assign_id) {
+                        self.assignment_detail.pending_file = Some((filename, data));
+                        self.assignment_detail.upload_state = UploadState::Idle;
+                    }
+                    ctx.request_repaint();
+                }
+                AppMsg::AssignmentUploadDone { assign_id } => {
+                    if self.assignment_detail.assignment.as_ref().map(|a| a.id) == Some(assign_id) {
+                        self.assignment_detail.upload_state = UploadState::Done;
+                        self.assignment_detail.pending_file = None;
+                        self.assignment_detail.loading_status = true;
+                        self.fetch_assignment_status(assign_id);
+                    }
+                    self.assignments.submission_statuses.remove(&assign_id);
+                    ctx.request_repaint();
+                }
+                AppMsg::AssignmentUploadFailed { assign_id, error } => {
+                    if self.assignment_detail.assignment.as_ref().map(|a| a.id) == Some(assign_id) {
+                        self.assignment_detail.upload_state = UploadState::Error(error);
+                    }
                     ctx.request_repaint();
                 }
                 AppMsg::TokenExpired => {
@@ -915,7 +1056,8 @@ impl eframe::App for App {
                                 });
                                 egui::CentralPanel::default().show_inside(ui, |ui| {
                                     match self.course_content.show(ui) {
-                                        Some(CourseContentEvent::OpenUrl(url)) => {
+                                        Some(CourseContentEvent::OpenUrl { url, module_id }) => {
+                                            self.record_activity(module_id, "opened");
                                             let _ = self.tx.send(AppMsg::OpenUrl(url));
                                         }
                                         Some(CourseContentEvent::Download { module_id, url, save_path }) => {
@@ -923,7 +1065,48 @@ impl eframe::App for App {
                                             self.download_file(module_id, url, save_path);
                                         }
                                         Some(CourseContentEvent::OpenFile(path)) => {
+                                            // Find module_id by matching path in download_states
+                                            let mid = self.course_content.download_states.iter()
+                                                .find_map(|(id, ds)| match ds {
+                                                    DownloadState::Done(p) if *p == path => Some(*id),
+                                                    _ => None,
+                                                });
+                                            if let Some(mid) = mid { self.record_activity(mid, "opened"); }
                                             let _ = open::that(&path);
+                                        }
+                                        Some(CourseContentEvent::OpenAssignment { cmid, name: _ }) => {
+                                            // Find the Assignment by cmid in loaded assignments
+                                            let found = self.assignments.courses.iter()
+                                                .flat_map(|c| c.assignments.iter().map(move |a| (a, c.fullname.clone())))
+                                                .find(|(a, _)| a.cmid == cmid)
+                                                .map(|(a, cn)| (a.clone(), cn));
+                                            if let Some((assign, course_name)) = found {
+                                                let assign_id = assign.id;
+                                                self.assignment_detail.assignment = Some(assign);
+                                                self.assignment_detail.course_name = course_name;
+                                                self.assignment_detail.status = self.assignments.submission_statuses.get(&assign_id).cloned();
+                                                self.assignment_detail.loading_status = self.assignment_detail.status.is_none();
+                                                self.assignment_detail.upload_state = UploadState::Idle;
+                                                self.assignment_detail.pending_file = None;
+                                                if self.assignment_detail.status.is_none() && !self.assignments.loading_statuses.contains(&assign_id) {
+                                                    self.assignments.loading_statuses.insert(assign_id);
+                                                    self.fetch_assignment_status(assign_id);
+                                                }
+                                                // Load assignments if not yet fetched
+                                                if !self.assignments_loaded {
+                                                    self.assignments_loaded = true;
+                                                    self.fetch_assignments();
+                                                }
+                                                self.active_tab = Tab::Assignments;
+                                            } else {
+                                                // Assignments not loaded yet — load them and open in browser as fallback
+                                                if !self.assignments_loaded {
+                                                    self.assignments_loaded = true;
+                                                    self.fetch_assignments();
+                                                }
+                                                let url = format!("https://sci.cmb.ac.lk/lms/mod/assign/view.php?id={cmid}");
+                                                let _ = self.tx.send(AppMsg::OpenUrl(url));
+                                            }
                                         }
                                         Some(CourseContentEvent::ShowFolder(path)) => {
                                             let folder = path.parent()
@@ -941,11 +1124,55 @@ impl eframe::App for App {
                         Tab::Announcements => { self.announcements.show(ui); }
                         Tab::Assignments  => {
                             use crate::screens::assignments::AssignmentsEvent;
-                            if let Some(ev) = self.assignments.show(ui) {
+                            if self.assignment_detail.assignment.is_some() {
+                                if let Some(ev) = self.assignment_detail.show(ui) {
+                                    match ev {
+                                        AssignmentDetailEvent::Back => {
+                                            self.assignment_detail.assignment = None;
+                                        }
+                                        AssignmentDetailEvent::UploadFile => {
+                                            if let Some(assign) = &self.assignment_detail.assignment {
+                                                let id = assign.id;
+                                                self.pick_file_for_assignment(id);
+                                            }
+                                        }
+                                        AssignmentDetailEvent::SubmitForGrading => {
+                                            if let Some((fname, data)) = self.assignment_detail.pending_file.take() {
+                                                if let Some(assign) = &self.assignment_detail.assignment {
+                                                    let id = assign.id;
+                                                    self.assignment_detail.upload_state = UploadState::Uploading;
+                                                    self.upload_and_submit(id, fname, data);
+                                                }
+                                            }
+                                        }
+                                        AssignmentDetailEvent::OpenFile { url } => {
+                                            let token = self.token.clone();
+                                            let sep = if url.contains('?') { '&' } else { '?' };
+                                            let _ = open::that(format!("{url}{sep}token={token}"));
+                                        }
+                                        AssignmentDetailEvent::OpenInBrowser { url } => {
+                                            let _ = self.tx.send(AppMsg::OpenUrl(url));
+                                        }
+                                    }
+                                }
+                            } else if let Some(ev) = self.assignments.show(ui) {
                                 match ev {
                                     AssignmentsEvent::RequestStatus(id) => {
                                         self.assignments.loading_statuses.insert(id);
                                         self.fetch_assignment_status(id);
+                                    }
+                                    AssignmentsEvent::OpenDetail { assign, course_name } => {
+                                        let assign_id = assign.id;
+                                        self.assignment_detail.assignment = Some(assign.clone());
+                                        self.assignment_detail.course_name = course_name;
+                                        self.assignment_detail.status = self.assignments.submission_statuses.get(&assign_id).cloned();
+                                        self.assignment_detail.loading_status = self.assignment_detail.status.is_none();
+                                        self.assignment_detail.upload_state = UploadState::Idle;
+                                        self.assignment_detail.pending_file = None;
+                                        if self.assignment_detail.status.is_none() && !self.assignments.loading_statuses.contains(&assign_id) {
+                                            self.assignments.loading_statuses.insert(assign_id);
+                                            self.fetch_assignment_status(assign_id);
+                                        }
                                     }
                                 }
                             }

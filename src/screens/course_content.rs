@@ -4,11 +4,13 @@ use egui::Ui;
 use chrono::{Datelike, NaiveDate, Utc};
 use crate::api::types::{CourseSection, CourseModule};
 use crate::models::decode_html;
+use crate::storage::ContentChange;
 
 const MOODLE_BASE: &str = "https://sci.cmb.ac.lk/lms";
 
 pub enum CourseContentEvent {
-    OpenUrl(String),
+    OpenUrl { url: String, module_id: u64 },
+    OpenAssignment { cmid: u64, name: String },
     Download { module_id: u64, url: String, save_path: PathBuf },
     OpenFile(PathBuf),
     ShowFolder(PathBuf),
@@ -28,6 +30,8 @@ pub struct CourseContentScreen {
     pub loading: bool,
     pub needs_scroll: bool,
     pub download_states: HashMap<u64, DownloadState>,
+    pub recent_changes: Vec<ContentChange>,
+    pub show_changes: bool,
 }
 
 impl Default for CourseContentScreen {
@@ -39,6 +43,8 @@ impl Default for CourseContentScreen {
             loading: false,
             needs_scroll: true,
             download_states: HashMap::new(),
+            recent_changes: vec![],
+            show_changes: false,
         }
     }
 }
@@ -102,6 +108,23 @@ fn strip_html(s: &str) -> String {
     }).0
 }
 
+/// Extract the first href="..." value from an HTML string.
+fn extract_first_href(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let start = lower.find("href=")?;
+    let rest = &html[start + 5..];
+    let (quote, rest) = if rest.starts_with('"') {
+        ('"', &rest[1..])
+    } else if rest.starts_with('\'') {
+        ('\'', &rest[1..])
+    } else {
+        return None;
+    };
+    let end = rest.find(quote)?;
+    let href = rest[..end].trim().to_string();
+    if href.is_empty() || href.starts_with('#') { None } else { Some(href) }
+}
+
 fn parse_section_date(s: &str) -> Option<NaiveDate> {
     let s = s.trim();
     let months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
@@ -134,6 +157,14 @@ fn section_is_current_week(name: &str) -> bool {
     today >= start && today <= end
 }
 
+fn fmt_time_ago(ts: i64) -> String {
+    let diff = chrono::Utc::now().timestamp() - ts;
+    if diff < 60 { "just now".into() }
+    else if diff < 3600 { format!("{} min ago", diff / 60) }
+    else if diff < 86400 { format!("{:.0}h ago", diff as f64 / 3600.0) }
+    else { format!("{:.0}d ago", diff as f64 / 86400.0) }
+}
+
 impl CourseContentScreen {
     pub fn show(&mut self, ui: &mut Ui) -> Option<CourseContentEvent> {
         let mut event = None;
@@ -152,6 +183,86 @@ impl CourseContentScreen {
             return None;
         }
 
+        // ── What's New panel ─────────────────────────────────────────────────
+        if self.show_changes && !self.recent_changes.is_empty() {
+            egui::TopBottomPanel::top("whats_new_panel").show_inside(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(
+                        format!("{} What's New  ({} changes)", egui_phosphor::regular::BELL_RINGING, self.recent_changes.len()))
+                        .size(13.0).strong().color(egui::Color32::from_rgb(255, 200, 60)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕ Dismiss").clicked() {
+                            self.show_changes = false;
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    for ch in &self.recent_changes {
+                        ui.horizontal(|ui| {
+                            let (icon, color) = match ch.change_type.as_str() {
+                                "added"        => (egui_phosphor::regular::PLUS_CIRCLE, egui::Color32::from_rgb(80, 200, 80)),
+                                "removed"      => (egui_phosphor::regular::MINUS_CIRCLE, egui::Color32::from_rgb(200, 80, 80)),
+                                "renamed"      => (egui_phosphor::regular::PENCIL_SIMPLE, egui::Color32::from_rgb(150, 180, 255)),
+                                "file_updated" => (egui_phosphor::regular::ARROW_CLOCKWISE, egui::Color32::from_rgb(255, 180, 60)),
+                                _              => (egui_phosphor::regular::DOT, ui.visuals().weak_text_color()),
+                            };
+                            ui.label(egui::RichText::new(icon).color(color).size(12.0));
+                            ui.label(egui::RichText::new(&ch.module_name).size(12.0));
+                            if !ch.section_name.is_empty() {
+                                ui.label(egui::RichText::new(format!("— {}", ch.section_name))
+                                    .size(11.0).color(ui.visuals().weak_text_color()));
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(fmt_time_ago(ch.detected_at))
+                                    .size(10.0).color(ui.visuals().weak_text_color()));
+                                match ch.change_type.as_str() {
+                                    "renamed" => {
+                                        ui.label(egui::RichText::new(
+                                            format!("{} → {}", ch.old_val, ch.new_val))
+                                            .size(10.0).color(egui::Color32::from_rgb(150, 180, 255)));
+                                    }
+                                    "file_updated" => {
+                                        ui.label(egui::RichText::new(
+                                            format!("{} → {}", ch.old_val, ch.new_val))
+                                            .size(10.0).color(egui::Color32::from_rgb(255, 180, 60)));
+                                    }
+                                    _ => {}
+                                }
+                            });
+                            // Inline diff for description_updated
+                            if ch.change_type == "description_updated" {
+                                ui.add_space(2.0);
+                                egui::Frame::none()
+                                    .fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 60))
+                                    .rounding(3.0)
+                                    .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        for line in ch.new_val.lines() {
+                                            if line.starts_with("+ ") {
+                                                ui.label(egui::RichText::new(line)
+                                                    .size(10.5).monospace()
+                                                    .background_color(egui::Color32::from_rgba_premultiplied(0, 80, 0, 100))
+                                                    .color(egui::Color32::from_rgb(120, 220, 120)));
+                                            } else if line.starts_with("- ") {
+                                                ui.label(egui::RichText::new(line)
+                                                    .size(10.5).monospace()
+                                                    .background_color(egui::Color32::from_rgba_premultiplied(80, 0, 0, 100))
+                                                    .color(egui::Color32::from_rgb(220, 100, 100)));
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        }
+
+        // ── Main scroll area ─────────────────────────────────────────────────
         let current_week_idx: Option<usize> = self.sections.iter().enumerate()
             .find(|(_, s)| section_is_current_week(&s.name))
             .map(|(i, _)| i);
@@ -235,27 +346,32 @@ fn render_module(
     let mut event = None;
 
     let (icon, tooltip) = match module.modname.as_str() {
-        "assign"   => (egui_phosphor::regular::PENCIL_SIMPLE, "Assignment"),
-        "resource" => (egui_phosphor::regular::FILE_TEXT, "File Resource"),
-        "forum"    => (egui_phosphor::regular::CHATS, "Forum"),
-        "quiz"     => (egui_phosphor::regular::QUESTION, "Quiz"),
-        "folder"   => (egui_phosphor::regular::FOLDER, "Folder"),
-        "url"      => (egui_phosphor::regular::LINK, "External Link"),
-        "label"    => ("", ""),
-        _          => (egui_phosphor::regular::PACKAGE, "Module Item"),
+        "assign"          => (egui_phosphor::regular::PENCIL_SIMPLE, "Assignment"),
+        "resource"        => (egui_phosphor::regular::FILE_TEXT, "File Resource"),
+        "forum"           => (egui_phosphor::regular::CHATS, "Forum"),
+        "quiz"            => (egui_phosphor::regular::QUESTION, "Quiz"),
+        "folder"          => (egui_phosphor::regular::FOLDER, "Folder"),
+        "url" | "label"   => (egui_phosphor::regular::LINK, "External Link"),
+        _                 => (egui_phosphor::regular::PACKAGE, "Module Item"),
     };
 
+    // ── Label module ─────────────────────────────────────────────────────────
     if module.modname == "label" {
-        let text = decode_html(&module.name);
-        if !text.trim().is_empty() {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(text.trim()).size(13.0));
-            ui.add_space(4.0);
+        let desc = module.description.as_deref().unwrap_or("");
+        // If description has an embedded link, fall through to card rendering
+        if extract_first_href(desc).is_none() {
+            // Plain label — render as text
+            let text = strip_html(&decode_html(&module.name));
+            if !text.trim().is_empty() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(text.trim()).size(13.0));
+                ui.add_space(4.0);
+            }
+            return None;
         }
-        return None;
     }
 
-    // "page" module: render inline if content available
+    // ── Page module — render inline ───────────────────────────────────────────
     if module.modname == "page" {
         if let Some(html) = &module.mainpage {
             let text = strip_html(&decode_html(html));
@@ -277,27 +393,23 @@ fn render_module(
         }
     }
 
-    // Determine file info and URLs
+    // ── Determine action ──────────────────────────────────────────────────────
     let first_file = module.contents.first();
     let fileurl = first_file.map(|f| f.fileurl.clone());
     let filename = first_file.map(|f| f.filename.as_str()).unwrap_or("");
     let filesize = first_file.map(|f| f.filesize).unwrap_or(0);
 
-    // Choose action URL based on module type
     let is_file_module = matches!(module.modname.as_str(), "resource" | "folder");
-    let is_media = is_streamable(filename);
 
     let action: ModuleAction = if is_file_module {
         if let Some(url) = &fileurl {
-            if is_media {
+            if is_streamable(filename) {
                 ModuleAction::Stream(url.clone(), filename.to_string())
             } else {
-                // Check if already downloaded
                 let save_path = file_save_path(course, section, filename);
                 match &download_state {
-                    Some(DownloadState::Done(p)) if p.exists() => {
-                        ModuleAction::AlreadyDownloaded(p.clone())
-                    }
+                    Some(DownloadState::Done(p)) if p.exists() =>
+                        ModuleAction::AlreadyDownloaded(p.clone()),
                     _ => ModuleAction::Download(url.clone(), filename.to_string(), save_path),
                 }
             }
@@ -305,17 +417,28 @@ fn render_module(
             ModuleAction::None
         }
     } else if module.modname == "url" {
-        module.url.as_ref().map(|u| ModuleAction::OpenUrl(u.clone()))
-            .unwrap_or(ModuleAction::None)
+        // Use the actual external URL from contents, falling back to Moodle view page
+        let url = module.contents.first()
+            .map(|f| f.fileurl.clone())
+            .or_else(|| module.url.clone())
+            .unwrap_or_else(|| format!("{MOODLE_BASE}/mod/url/view.php?id={}", module.id));
+        ModuleAction::OpenUrl(url)
+    } else if module.modname == "label" {
+        // Has embedded link (plain labels returned above)
+        let desc = module.description.as_deref().unwrap_or("");
+        let href = extract_first_href(desc).unwrap_or_default();
+        ModuleAction::OpenUrl(href)
+    } else if module.modname == "assign" {
+        ModuleAction::OpenAssignment
     } else {
-        // assign, quiz, forum, page (fallback), etc. — open via wantsurl
+        // quiz, forum, page (fallback) — open via browser
         let url = module.url.clone()
             .or_else(|| fileurl.clone())
             .unwrap_or_else(|| format!("{MOODLE_BASE}/mod/{}/view.php?id={}", module.modname, module.id));
         ModuleAction::OpenUrl(url)
     };
 
-    // Card
+    // ── Card ──────────────────────────────────────────────────────────────────
     let inner = egui::Frame::none()
         .fill(match &action {
             ModuleAction::AlreadyDownloaded(_) =>
@@ -365,7 +488,7 @@ fn render_module(
                         }
                         _ => {
                             if let Some(desc) = &module.description {
-                                let d = decode_html(desc);
+                                let d = strip_html(&decode_html(desc));
                                 if !d.trim().is_empty() {
                                     ui.label(egui::RichText::new(d.trim()).size(11.0)
                                         .color(ui.visuals().weak_text_color()));
@@ -374,7 +497,6 @@ fn render_module(
                         }
                     }
 
-                    // Downloading spinner
                     if let Some(DownloadState::Downloading) = &download_state {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -387,7 +509,6 @@ fn render_module(
                             .size(10.5).color(egui::Color32::from_rgb(220, 80, 80)));
                     }
 
-                    // "Show in folder" button for downloaded files
                     if let ModuleAction::AlreadyDownloaded(path) = &action {
                         if ui.small_button("Show in folder").clicked() {
                             event = Some(CourseContentEvent::ShowFolder(path.clone()));
@@ -397,7 +518,7 @@ fn render_module(
             });
         });
 
-    // Click on card
+    // ── Click detection ───────────────────────────────────────────────────────
     let has_action = !matches!(&action, ModuleAction::None);
     let is_downloading = matches!(&download_state, Some(DownloadState::Downloading));
 
@@ -412,8 +533,9 @@ fn render_module(
         }
         if click_resp.clicked() {
             event = Some(match action {
-                ModuleAction::OpenUrl(url) => CourseContentEvent::OpenUrl(url),
-                ModuleAction::Stream(url, _) => CourseContentEvent::OpenUrl(url), // system player streams
+                ModuleAction::OpenUrl(url) => CourseContentEvent::OpenUrl { url, module_id: module.id },
+                ModuleAction::OpenAssignment => CourseContentEvent::OpenAssignment { cmid: module.id, name: module.name.clone() },
+                ModuleAction::Stream(url, _) => CourseContentEvent::OpenUrl { url, module_id: module.id },
                 ModuleAction::Download(url, _, path) => CourseContentEvent::Download {
                     module_id: module.id, url, save_path: path,
                 },
@@ -429,6 +551,7 @@ fn render_module(
 
 enum ModuleAction {
     OpenUrl(String),
+    OpenAssignment,
     Stream(String, String),            // url, filename
     Download(String, String, PathBuf), // url, filename, save_path
     AlreadyDownloaded(PathBuf),

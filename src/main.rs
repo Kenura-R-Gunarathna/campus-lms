@@ -4,6 +4,7 @@ mod background;
 mod models;
 mod screens;
 mod storage;
+mod telemetry;
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
