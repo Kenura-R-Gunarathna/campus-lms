@@ -1,12 +1,25 @@
 # AUR Update Configuration
 AUR_DIR ?= $(HOME)/aur/campus-lms-git
+AUR_REPO_URL ?= https://aur.archlinux.org/campus-lms-git.git
 
 .PHONY: help
 help:
 	@echo "Available commands:"
+	@echo "  make aur-init    - Clone the AUR repository for the first time"
 	@echo "  make aur-sync    - Update .SRCINFO and copy files to $(AUR_DIR)"
 	@echo "  make aur-push    - Sync and push changes to AUR"
 	@echo "  make push-all    - Push to GitHub and then update AUR"
+
+.PHONY: aur-init
+aur-init:
+	@echo "Ensuring AUR parent directory exists..."
+	mkdir -p $(shell dirname $(AUR_DIR))
+	@if [ ! -d "$(AUR_DIR)" ]; then \
+		echo "Cloning AUR repository from $(AUR_REPO_URL)..."; \
+		git clone $(AUR_REPO_URL) $(AUR_DIR); \
+	else \
+		echo "AUR directory already exists at $(AUR_DIR)"; \
+	fi
 
 .PHONY: aur-sync
 aur-sync:
