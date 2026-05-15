@@ -5,11 +5,16 @@ AUR_REPO_URL ?= https://aur.archlinux.org/campus-lms-git.git
 .PHONY: help
 help:
 	@echo "Available commands:"
-	@echo "  make aur-init    - Clone the AUR repository for the first time"
-	@echo "  make aur-sync    - Update .SRCINFO and copy files to $(AUR_DIR)"
-	@echo "  make aur-push    - Sync and push changes to AUR"
-	@echo "  make push-all    - Push to GitHub and then update AUR"
-	@echo "  make release v=X.Y.Z - Create a new tag and trigger GitHub Release"
+	@echo "  make aur-init         - Clone the AUR repository for the first time"
+	@echo "                          (Use this only once to set up your local AUR folder)"
+	@echo "  make aur-sync         - Update .SRCINFO and copy files to $(AUR_DIR)"
+	@echo "                          (Prepares the AUR folder with latest packaging files)"
+	@echo "  make aur-push         - Sync and push changes to AUR"
+	@echo "                          (Full cycle: generates metadata, copies files, and pushes to Arch servers)"
+	@echo "  make push-all         - Push to GitHub and then update AUR"
+	@echo "                          (Recommended daily workflow: keeps GitHub and AUR in perfect sync)"
+	@echo "  make release v=X.Y.Z  - Create a new tag and trigger GitHub Release"
+	@echo "                          (Triggers GitHub Actions to build and upload Linux/Windows binaries)"
 
 .PHONY: release
 release:

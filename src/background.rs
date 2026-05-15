@@ -139,40 +139,80 @@ async fn poll_content_changes(token: &str, storage: &Storage) {
 }
 
 pub fn is_dev_binary() -> bool {
-    std::env::current_exe().map(|p| {
-        let s = p.to_string_lossy();
-        s.contains("/target/debug/") || s.contains("/tmp/")
-            || (s.contains("/target/release/") && s.contains("/deps/"))
-    }).unwrap_or(false)
+    let p = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().to_lowercase(),
+        Err(_) => return false,
+    };
+    p.contains("target/debug") || p.contains("target\\debug")
+        || p.contains("/tmp/") || p.contains("\\temp\\")
+        || ((p.contains("target/release") || p.contains("target\\release")) && p.contains("deps"))
 }
 
 pub struct DaemonStatus {
-    pub desktop_file_exists: bool,
+    pub desktop_file_exists: bool, // on Windows, means Registry Key exists
     pub desktop_exe_path: Option<String>,
     pub current_exe_path: String,
     pub paths_match: bool,
     pub is_dev_binary: bool,
 }
 
+#[cfg(target_os = "windows")]
+mod win_util {
+    pub fn get_reg_key() -> Option<String> {
+        let hkcu = winreg::enums::HKEY_CURRENT_USER;
+        let path = r"Software\Microsoft\Windows\CurrentVersion\Run";
+        let reg = winreg::RegKey::predef(hkcu);
+        let key = reg.open_subsection(path, winreg::enums::KEY_READ).ok()?;
+        key.get_value("CampusLMS").ok()
+    }
+}
+
 pub fn daemon_status() -> DaemonStatus {
     let current_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let desktop_path = dirs_next::config_dir()
-        .map(|d| d.join("autostart").join("campus-lms.desktop"));
-    let desktop_file_exists = desktop_path.as_ref().map(|p| p.exists()).unwrap_or(false);
-    let desktop_exe_path = desktop_path
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|contents| {
-            contents.lines()
-                .find(|l| l.starts_with("Exec="))
-                .map(|l| l["Exec=".len()..].trim().trim_end_matches(" --background").to_string())
-        });
-    let paths_match = desktop_exe_path.as_deref() == Some(current_exe.as_str());
+
+    #[cfg(target_os = "linux")]
+    {
+        let desktop_path = dirs_next::config_dir()
+            .map(|d| d.join("autostart").join("campus-lms.desktop"));
+        let desktop_file_exists = desktop_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+        let desktop_exe_path = desktop_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|contents| {
+                contents.lines()
+                    .find(|l| l.starts_with("Exec="))
+                    .map(|l| l["Exec=".len()..].trim().trim_end_matches(" --background").to_string())
+            });
+        let paths_match = desktop_exe_path.as_deref() == Some(current_exe.as_str());
+        DaemonStatus {
+            desktop_file_exists,
+            paths_match,
+            desktop_exe_path,
+            current_exe_path: current_exe,
+            is_dev_binary: is_dev_binary(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let reg_path = win_util::get_reg_key();
+        let exists = reg_path.is_some();
+        let paths_match = reg_path.as_ref().map(|p| p.trim_matches('"').starts_with(&current_exe)).unwrap_or(false);
+        DaemonStatus {
+            desktop_file_exists: exists,
+            paths_match,
+            desktop_exe_path: reg_path,
+            current_exe_path: current_exe,
+            is_dev_binary: is_dev_binary(),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     DaemonStatus {
-        desktop_file_exists,
-        paths_match,
-        desktop_exe_path,
+        desktop_file_exists: false,
+        paths_match: false,
+        desktop_exe_path: None,
         current_exe_path: current_exe,
         is_dev_binary: is_dev_binary(),
     }
@@ -181,29 +221,62 @@ pub fn daemon_status() -> DaemonStatus {
 pub fn create_autostart() -> std::io::Result<()> {
     if is_dev_binary() {
         return Err(std::io::Error::other(
-            "Dev binary detected. Build with `cargo build --release` and install \
-             to a stable path (e.g. ~/.local/bin/campus-lms) first."
+            "Dev binary detected. Please use a release build in a stable path."
         ));
     }
     let exe = std::env::current_exe()?;
-    let dir = dirs_next::config_dir()
-        .ok_or_else(|| std::io::Error::other("no config dir"))?
-        .join("autostart");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("campus-lms.desktop"), format!(
-        "[Desktop Entry]\nType=Application\nName=Campus LMS Notifications\nExec={} --background\nHidden=false\nX-GNOME-Autostart-enabled=true\n",
-        exe.display()
-    ))
+
+    #[cfg(target_os = "linux")]
+    {
+        let dir = dirs_next::config_dir()
+            .ok_or_else(|| std::io::Error::other("no config dir"))?
+            .join("autostart");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("campus-lms.desktop"), format!(
+            "[Desktop Entry]\nType=Application\nName=Campus LMS Notifications\nExec={} --background\nHidden=false\nX-GNOME-Autostart-enabled=true\n",
+            exe.display()
+        ))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let hkcu = winreg::enums::HKEY_CURRENT_USER;
+        let path = r"Software\Microsoft\Windows\CurrentVersion\Run";
+        let reg = winreg::RegKey::predef(hkcu);
+        let (key, _) = reg.create_subsection(path)?;
+        let cmd = format!("\"{}\" --background", exe.display());
+        key.set_value("CampusLMS", &cmd)?;
+    }
+
+    Ok(())
 }
 
 pub fn remove_autostart() {
+    #[cfg(target_os = "linux")]
     if let Some(dir) = dirs_next::config_dir() {
         let _ = std::fs::remove_file(dir.join("autostart").join("campus-lms.desktop"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let hkcu = winreg::enums::HKEY_CURRENT_USER;
+        let path = r"Software\Microsoft\Windows\CurrentVersion\Run";
+        let reg = winreg::RegKey::predef(hkcu);
+        if let Ok(key) = reg.open_subsection(path, winreg::enums::KEY_WRITE) {
+            let _ = key.delete_value("CampusLMS");
+        }
     }
 }
 
 pub fn autostart_enabled() -> bool {
-    dirs_next::config_dir()
+    #[cfg(target_os = "linux")]
+    return dirs_next::config_dir()
         .map(|d| d.join("autostart").join("campus-lms.desktop").exists())
-        .unwrap_or(false)
+        .unwrap_or(false);
+
+    #[cfg(target_os = "windows")]
+    return win_util::get_reg_key().is_some();
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    false
 }
