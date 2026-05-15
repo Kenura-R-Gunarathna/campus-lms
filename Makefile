@@ -9,6 +9,16 @@ help:
 	@echo "  make aur-sync    - Update .SRCINFO and copy files to $(AUR_DIR)"
 	@echo "  make aur-push    - Sync and push changes to AUR"
 	@echo "  make push-all    - Push to GitHub and then update AUR"
+	@echo "  make release v=X.Y.Z - Create a new tag and trigger GitHub Release"
+
+.PHONY: release
+release:
+	@if [ -z "$(v)" ]; then echo "Error: Provide a version, e.g., make release v=1.0.0"; exit 1; fi
+	@echo "Tagging version v$(v)..."
+	git tag -a v$(v) -m "Release v$(v)"
+	@echo "Pushing tag to GitHub..."
+	git push origin v$(v)
+	@echo "GitHub Action will now build binaries for Linux and Windows."
 
 .PHONY: aur-init
 aur-init:
