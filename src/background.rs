@@ -280,3 +280,24 @@ pub fn autostart_enabled() -> bool {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     false
 }
+
+pub fn check_for_updates(tx: std::sync::mpsc::Sender<crate::app::AppMsg>) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .user_agent("campus-lms")
+            .build().unwrap_or_default();
+        let url = "https://api.github.com/repos/Kenura-R-Gunarathna/campus-lms/releases/latest";
+        let resp = client.get(url).send().await;
+        if let Ok(resp) = resp {
+            if let Ok(release) = resp.json::<serde_json::Value>().await {
+                if let Some(tag) = release["tag_name"].as_str() {
+                    let latest = tag.trim_start_matches('v');
+                    let current = env!("CARGO_PKG_VERSION");
+                    if latest != current {
+                        let _ = tx.send(crate::app::AppMsg::UpdateAvailable(tag.to_string()));
+                    }
+                }
+            }
+        }
+    });
+}

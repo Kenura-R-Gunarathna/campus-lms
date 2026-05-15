@@ -49,7 +49,7 @@ const TABS: &[Tab] = &[
 
 enum Screen { Login, Main }
 
-enum AppMsg {
+pub enum AppMsg {
     LoginOk { token: String, private_token: String, info: SiteInfo },
     LoginErr(String),
     CoursesLoaded(Vec<Course>),
@@ -70,6 +70,7 @@ enum AppMsg {
     FilePicked { assign_id: u64, filename: String, data: Vec<u8> },
     AssignmentUploadDone { assign_id: u64 },
     AssignmentUploadFailed { assign_id: u64, error: String },
+    UpdateAvailable(String),
 }
 
 
@@ -119,6 +120,7 @@ pub struct App {
     diff_history: DiffHistoryScreen,
     show_diff_history: bool,
     show_bg_suggestion: bool,
+    update_version: Option<String>,
     tx: Sender<AppMsg>,
     rx: Receiver<AppMsg>,
 }
@@ -176,6 +178,7 @@ impl App {
             diff_history: DiffHistoryScreen::default(),
             show_diff_history: false,
             show_bg_suggestion: false,
+            update_version: None,
             tx,
             rx,
         };
@@ -276,6 +279,8 @@ impl App {
                 });
             }
         }
+
+        background::check_for_updates(app.tx.clone());
 
         app
     }
@@ -1137,6 +1142,10 @@ impl eframe::App for App {
                     }
                     ctx.request_repaint();
                 }
+                AppMsg::UpdateAvailable(ver) => {
+                    self.update_version = Some(ver);
+                    ctx.request_repaint();
+                }
                 AppMsg::GradeOverviewLoaded(r) => {
                     self.grades.overview.clear();
                     for item in r.grades {
@@ -1331,6 +1340,28 @@ impl eframe::App for App {
                 self.show_tab_bar(ctx);
                 self.show_settings_panel(ctx);
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(new_ver) = self.update_version.clone() {
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(40, 80, 150))
+                            .rounding(4.0)
+                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("🚀 New version available: {new_ver}"))
+                                        .color(egui::Color32::WHITE).strong());
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Update Now").clicked() {
+                                            self.tx.send(AppMsg::OpenUrl("https://github.com/Kenura-R-Gunarathna/campus-lms/releases/latest".to_string())).ok();
+                                        }
+                                        if ui.button("Dismiss").clicked() {
+                                            self.update_version = None;
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+
                     match self.active_tab {
                         Tab::Courses => {
                             if self.assignment_detail.assignment.is_some()
