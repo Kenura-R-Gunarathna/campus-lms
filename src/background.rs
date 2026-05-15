@@ -162,7 +162,7 @@ mod win_util {
         let hkcu = winreg::enums::HKEY_CURRENT_USER;
         let path = r"Software\Microsoft\Windows\CurrentVersion\Run";
         let reg = winreg::RegKey::predef(hkcu);
-        let key = reg.open_subsection(path, winreg::enums::KEY_READ).ok()?;
+        let key = reg.open_subkey_with_flags(path, winreg::enums::KEY_READ).ok()?;
         key.get_value("CampusLMS").ok()
     }
 }
@@ -243,7 +243,7 @@ pub fn create_autostart() -> std::io::Result<()> {
         let hkcu = winreg::enums::HKEY_CURRENT_USER;
         let path = r"Software\Microsoft\Windows\CurrentVersion\Run";
         let reg = winreg::RegKey::predef(hkcu);
-        let (key, _) = reg.create_subsection(path)?;
+        let key = reg.create_subkey(path)?;
         let cmd = format!("\"{}\" --background", exe.display());
         key.set_value("CampusLMS", &cmd)?;
     }
@@ -262,7 +262,7 @@ pub fn remove_autostart() {
         let hkcu = winreg::enums::HKEY_CURRENT_USER;
         let path = r"Software\Microsoft\Windows\CurrentVersion\Run";
         let reg = winreg::RegKey::predef(hkcu);
-        if let Ok(key) = reg.open_subsection(path, winreg::enums::KEY_WRITE) {
+        if let Ok(key) = reg.open_subkey_with_flags(path, winreg::enums::KEY_WRITE) {
             let _ = key.delete_value("CampusLMS");
         }
     }
