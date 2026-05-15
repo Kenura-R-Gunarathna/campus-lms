@@ -4,13 +4,17 @@ use std::time::Instant;
 use crate::api::{is_token_error, types::*, MoodleClient};
 use crate::background;
 use crate::models::{decode_html, infer_student_year, parse_dept, year_label};
+use crate::log::LogEntry;
 use crate::screens::{
+    activity_log::ActivityLogScreen,
     announcements::{Announcement, AnnouncementsScreen},
     assignment_detail::{AssignmentDetailScreen, AssignmentDetailEvent, DetailSource, UploadState, extract_intro_images},
     assignments::AssignmentsScreen,
     calendar::CalendarScreen,
+    changes_feed::ChangesFeedScreen,
     courses::{CoursesEvent, CoursesScreen},
     course_content::{CourseContentScreen, CourseContentEvent, DownloadState},
+    diff_history::{DiffHistoryScreen, DiffHistoryEvent, group_into_snapshots},
     grades::GradesScreen,
     login::LoginScreen,
     notifications::NotificationsScreen,
@@ -21,12 +25,14 @@ use crate::storage::{Storage, ActivityEntry};
 const KEYRING_SERVICE: &str = "campus-lms";
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { Courses, Announcements, Assignments, Calendar, Notifications, Grades, Profile }
+enum Tab { Courses, Changes, Log, Announcements, Assignments, Calendar, Notifications, Grades, Profile }
 
 impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::Courses       => "Courses",
+            Tab::Changes       => "Changes",
+            Tab::Log           => "Log",
             Tab::Announcements => "Announcements",
             Tab::Assignments   => "Assignments",
             Tab::Calendar      => "Calendar",
@@ -37,8 +43,8 @@ impl Tab {
     }
 }
 const TABS: &[Tab] = &[
-    Tab::Courses, Tab::Announcements, Tab::Assignments, Tab::Calendar,
-    Tab::Notifications, Tab::Grades, Tab::Profile,
+    Tab::Courses, Tab::Changes, Tab::Log, Tab::Announcements, Tab::Assignments,
+    Tab::Calendar, Tab::Notifications, Tab::Grades, Tab::Profile,
 ];
 
 enum Screen { Login, Main }
@@ -99,6 +105,19 @@ pub struct App {
     // Settings panel
     show_settings: bool,
     bg_enabled: bool,
+    moodle_base: String,
+    moodle_base_edit: String,
+    autostart_error: Option<String>,
+    daemon_status: Option<background::DaemonStatus>,
+    // Activity log
+    activity_log_screen: ActivityLogScreen,
+    log_entries: Vec<LogEntry>,
+    // Changes feed
+    changes_feed: ChangesFeedScreen,
+    changes_feed_loaded: bool,
+    // Diff history
+    diff_history: DiffHistoryScreen,
+    show_diff_history: bool,
     tx: Sender<AppMsg>,
     rx: Receiver<AppMsg>,
 }
@@ -145,9 +164,28 @@ impl App {
             profile_loaded: false,
             show_settings: false,
             bg_enabled,
+            moodle_base: crate::api::DEFAULT_BASE.into(),
+            moodle_base_edit: crate::api::DEFAULT_BASE.into(),
+            autostart_error: None,
+            daemon_status: None,
+            activity_log_screen: ActivityLogScreen::default(),
+            log_entries: vec![LogEntry::info("system", "App started")],
+            changes_feed: ChangesFeedScreen::default(),
+            changes_feed_loaded: false,
+            diff_history: DiffHistoryScreen::default(),
+            show_diff_history: false,
             tx,
             rx,
         };
+
+        // Apply stored Moodle base URL (test server override)
+        if let Ok(Some(stored_base)) = app.storage.get("moodle_base") {
+            if !stored_base.is_empty() {
+                crate::api::set_moodle_base(stored_base.clone());
+                app.moodle_base = stored_base.clone();
+                app.moodle_base_edit = stored_base;
+            }
+        }
 
         if let (Ok(Some(token)), Ok(Some(uid))) = (
             app.storage.get("token"),
@@ -470,6 +508,13 @@ impl App {
         });
     }
 
+    fn log(&mut self, entry: LogEntry) {
+        if self.log_entries.len() >= 1000 {
+            self.log_entries.drain(0..200);
+        }
+        self.log_entries.push(entry);
+    }
+
     fn fetch_course_content(&self, course_id: u64) {
         let token = self.token.clone();
         let tx = self.tx.clone();
@@ -588,6 +633,8 @@ impl App {
                 self.flush_course_timer();
                 self.course_content.course_id = 0;
                 self.course_content.sections.clear();
+                self.course_content.expanded_change_ids.clear();
+                self.show_diff_history = false;
             }
         }
     }
@@ -702,37 +749,193 @@ impl App {
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
-            .default_width(300.0)
+            .default_width(340.0)
             .anchor(egui::Align2::RIGHT_TOP, [-10.0, 40.0])
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new("Background Notifications").strong());
                 ui.separator();
                 ui.add_space(4.0);
 
+                let status = self.daemon_status.get_or_insert_with(background::daemon_status);
+
+                if status.is_dev_binary {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_premultiplied(80, 40, 0, 200))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(egui::RichText::new(
+                                "Dev binary detected. Autostart won't survive a recompile.\n\
+                                 Build with `cargo build --release` and copy the binary to a \
+                                 stable path (e.g. ~/.local/bin/campus-lms) first.")
+                                .size(10.5).color(egui::Color32::from_rgb(255, 200, 100)));
+                        });
+                    ui.add_space(6.0);
+                }
+
                 let prev = self.bg_enabled;
                 ui.checkbox(&mut self.bg_enabled, "Run notification daemon on login");
                 if self.bg_enabled != prev {
                     if self.bg_enabled {
-                        if background::create_autostart().is_ok() {
-                            let tx_bg: std::sync::mpsc::Sender<u64> = {
-                                let (s, r) = std::sync::mpsc::channel::<u64>();
-                                let tx = self.tx.clone();
-                                std::thread::spawn(move || {
-                                    for count in r { let _ = tx.send(AppMsg::NewNotifications(count)); }
-                                });
-                                s
-                            };
-                            background::spawn_poller(self.token.clone(), self.userid, tx_bg);
+                        match background::create_autostart() {
+                            Ok(()) => {
+                                self.autostart_error = None;
+                                let tx_bg: std::sync::mpsc::Sender<u64> = {
+                                    let (s, r) = std::sync::mpsc::channel::<u64>();
+                                    let tx = self.tx.clone();
+                                    std::thread::spawn(move || {
+                                        for count in r { let _ = tx.send(AppMsg::NewNotifications(count)); }
+                                    });
+                                    s
+                                };
+                                background::spawn_poller(self.token.clone(), self.userid, tx_bg);
+                            }
+                            Err(e) => {
+                                self.bg_enabled = false;
+                                self.autostart_error = Some(e.to_string());
+                            }
                         }
                     } else {
                         background::remove_autostart();
+                        self.autostart_error = None;
                     }
+                    self.daemon_status = Some(background::daemon_status());
+                }
+
+                if let Some(err) = &self.autostart_error {
+                    ui.add_space(2.0);
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                }
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Daemon Status").strong().size(12.0));
+                ui.separator();
+
+                let status = self.daemon_status.get_or_insert_with(background::daemon_status);
+                ui.label(format!("Desktop file: {}",
+                    if status.desktop_file_exists { "exists" } else { "not found" }));
+                if status.desktop_file_exists {
+                    if status.paths_match {
+                        ui.colored_label(egui::Color32::from_rgb(80, 200, 80),
+                            "Binary path matches current exe ✓");
+                    } else {
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80),
+                            "Binary path MISMATCH — autostart points to stale binary");
+                    }
+                    if let Some(exe) = &status.desktop_exe_path.clone() {
+                        ui.label(egui::RichText::new(format!(".desktop exe: {exe}"))
+                            .size(10.0).monospace().color(ui.visuals().weak_text_color()));
+                    }
+                }
+                ui.label(egui::RichText::new(format!("Current exe: {}", status.current_exe_path.clone()))
+                    .size(10.0).monospace().color(ui.visuals().weak_text_color()));
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Test Notification").clicked() {
+                        background::desktop_notify("Campus LMS — Test", "Desktop notifications are working.");
+                    }
+                    if ui.button("Refresh status").clicked() {
+                        self.daemon_status = Some(background::daemon_status());
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(
+                    "Alternatively (if installed via AUR/package manager): \
+                     `systemctl --user enable --now campus-lms-daemon`")
+                    .size(10.5).color(ui.visuals().weak_text_color()));
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Server").strong());
+                ui.add_space(4.0);
+
+                let is_test = self.moodle_base != crate::api::DEFAULT_BASE;
+                if is_test {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_premultiplied(0, 60, 0, 120))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(
+                                format!("Test mode active: {}", self.moodle_base))
+                                .size(10.5).color(egui::Color32::from_rgb(100, 220, 100)));
+                        });
+                    ui.add_space(4.0);
+                }
+
+                ui.label(egui::RichText::new("Moodle base URL:").size(11.0));
+                ui.text_edit_singleline(&mut self.moodle_base_edit);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        let url = self.moodle_base_edit.trim_end_matches('/').to_string();
+                        crate::api::set_moodle_base(url.clone());
+                        self.moodle_base = url.clone();
+                        self.storage.set("moodle_base", &url).ok();
+                        self.log(crate::log::LogEntry::info("system", format!("Server changed to: {}", url)));
+                    }
+                    if ui.button("Use localhost:8888").clicked() {
+                        let url = "http://localhost:8888".to_string();
+                        self.moodle_base_edit = url.clone();
+                        crate::api::set_moodle_base(url.clone());
+                        self.moodle_base = url.clone();
+                        self.storage.set("moodle_base", &url).ok();
+                        self.log(crate::log::LogEntry::info("system", "Switched to test server (localhost:8888)"));
+                    }
+                    if is_test && ui.button("Reset to production").clicked() {
+                        let url = crate::api::DEFAULT_BASE.to_string();
+                        self.moodle_base_edit = url.clone();
+                        crate::api::set_moodle_base(url.clone());
+                        self.moodle_base = url.clone();
+                        self.storage.set("moodle_base", &url).ok();
+                        self.log(crate::log::LogEntry::info("system", "Switched back to production server"));
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(
+                    "Run mock server: cargo run --bin mock_server\nThen login with any username/password.")
+                    .size(10.0).color(ui.visuals().weak_text_color()));
+
+                if is_test {
+                    ui.add_space(8.0);
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_premultiplied(0, 40, 60, 120))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Test workflow:")
+                                .size(10.5).strong().color(egui::Color32::from_rgb(100, 180, 255)));
+                            ui.label(egui::RichText::new(
+                                "1. curl http://localhost:8888/admin/reset\n\
+                                 2. Click \"Clear diff data\" below\n\
+                                 3. Log out → log in with any username/password\n\
+                                 4. Open a course (seeds fingerprints at v1)\n\
+                                 5. curl http://localhost:8888/admin/bump\n\
+                                 6. Reopen the course → diffs appear in Changes tab\n\
+                                 Each bump always changes content (description + file size).")
+                                .size(10.0).color(egui::Color32::from_rgb(180, 200, 220)));
+                        });
                 }
 
                 ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Diff tracking data").strong().size(11.0));
+                ui.add_space(2.0);
                 ui.label(egui::RichText::new(
-                    "Polls notifications every 10 min and course content changes every 30 min. Sends desktop notifications for new activity and updated course materials.")
-                    .size(11.0).color(ui.visuals().weak_text_color()));
+                    "Clears all stored fingerprints and recorded changes.\nUse this to restart diff tracking or for clean testing.")
+                    .size(10.0).color(ui.visuals().weak_text_color()));
+                ui.add_space(4.0);
+                if ui.button("Clear diff data").clicked() {
+                    self.storage.clear_telemetry().ok();
+                    self.changes_feed_loaded = false;
+                    self.changes_feed = ChangesFeedScreen::default();
+                    self.log(LogEntry::info("system", "Diff tracking data cleared (fingerprints + changes reset)"));
+                }
 
                 ui.add_space(10.0);
                 if ui.button("Close").clicked() { self.show_settings = false; }
@@ -745,6 +948,7 @@ impl eframe::App for App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMsg::LoginOk { token, private_token, info } => {
+                    self.log(LogEntry::success("auth", format!("Logged in as {} (uid {})", info.fullname, info.userid)));
                     self.storage.set("token", &token).ok();
                     self.storage.set("private_token", &private_token).ok();
                     self.storage.set("userid", &info.userid.to_string()).ok();
@@ -774,11 +978,13 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 AppMsg::LoginErr(err) => {
+                    self.log(LogEntry::error("auth", format!("Login failed: {}", err)));
                     self.login.error = Some(err);
                     self.login.loading = false;
                     ctx.request_repaint();
                 }
                 AppMsg::CoursesLoaded(courses) => {
+                    self.log(LogEntry::info("system", format!("Loaded {} courses", courses.len())));
                     self.student_year = infer_student_year(&courses);
                     for c in &courses {
                         if let Ok(m) = self.storage.get_course_metrics(c.id) {
@@ -808,28 +1014,50 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 AppMsg::CourseContentLoaded { course_id, sections } => {
+                    let course_label = self.courses.courses.iter()
+                        .find(|c| c.id == course_id)
+                        .map(|c| c.shortname.clone())
+                        .unwrap_or_else(|| format!("#{}", course_id));
+                    self.log(LogEntry::info("diff", format!("Fetched content for {} ({} sections)", course_label, sections.len())));
+
                     // Diff against fingerprints to detect changes
-                    if let Ok(stored) = self.storage.load_fingerprints(course_id) {
-                        let (changes, new_fps, removed_ids) = crate::telemetry::diff_content(course_id, &sections, &stored);
-                        if !changes.is_empty() {
-                            let _ = self.storage.save_changes(&changes);
-                            if let Ok(counts) = self.storage.unseen_change_counts() {
-                                self.courses.change_counts = counts;
-                            }
-                            // If currently viewing this course, refresh What's New panel
-                            if self.course_content.course_id == course_id {
-                                if let Ok(rc) = self.storage.recent_changes(course_id, 20) {
-                                    self.course_content.recent_changes = rc;
-                                    self.course_content.show_changes = true;
-                                }
-                                // Re-mark seen since user is actively looking at it
-                                let _ = self.storage.mark_changes_seen(course_id);
-                                self.courses.change_counts.remove(&course_id);
-                            }
-                        }
-                        let _ = self.storage.upsert_fingerprints(course_id, &new_fps);
-                        let _ = self.storage.delete_fingerprints(&removed_ids);
+                    let stored_mods = self.storage.load_fingerprints(course_id).unwrap_or_default();
+                    let stored_secs = self.storage.load_section_fingerprints(course_id).unwrap_or_default();
+                    
+                    let first_run = stored_mods.is_empty() && stored_secs.is_empty();
+                    let (changes, new_mods, new_secs, rem_mods, rem_secs) = 
+                        crate::telemetry::diff_content(course_id, &sections, &stored_mods, &stored_secs);
+                    
+                    if first_run {
+                        self.log(LogEntry::info("diff", format!("{}: first visit — fingerprints seeded ({} modules), no diffs yet", course_label, new_mods.len())));
+                    } else if changes.is_empty() {
+                        self.log(LogEntry::info("diff", format!("{}: no changes detected", course_label)));
+                    } else {
+                        let types: Vec<String> = changes.iter().map(|c| format!("{} ({})", c.module_name, c.change_type)).collect();
+                        self.log(LogEntry::success("diff", format!("{}: {} change(s) detected — {}", course_label, changes.len(), types.join(", "))));
                     }
+
+                    if !changes.is_empty() {
+                        let _ = self.storage.save_changes(&changes);
+                        self.changes_feed_loaded = false; // force refresh of Changes tab
+                        if let Ok(counts) = self.storage.unseen_change_counts() {
+                            self.courses.change_counts = counts;
+                        }
+                        // If currently viewing this course, refresh What's New panel
+                        if self.course_content.course_id == course_id {
+                            if let Ok(rc) = self.storage.recent_changes(course_id, 20) {
+                                self.course_content.recent_changes = rc;
+                                self.course_content.show_changes = true;
+                            }
+                            // Re-mark seen since user is actively looking at it
+                            let _ = self.storage.mark_changes_seen(course_id);
+                            self.courses.change_counts.remove(&course_id);
+                        }
+                    }
+                    let _ = self.storage.upsert_fingerprints(course_id, &new_mods);
+                    let _ = self.storage.upsert_section_fingerprints(course_id, &new_secs);
+                    let _ = self.storage.delete_fingerprints(&rem_mods);
+                    let _ = self.storage.delete_section_fingerprints(&rem_secs);
 
                     if self.course_content.course_id == course_id {
                         if let Ok(json) = serde_json::to_string(&sections) {
@@ -898,6 +1126,7 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 AppMsg::NotificationsLoaded(r) => {
+                    self.log(LogEntry::info("notification", format!("Notifications loaded: {} unread", r.unreadcount)));
                     self.notifications.unread_count = r.unreadcount;
                     self.notifications.notifications = r.notifications;
                     if let Ok(json) = serde_json::to_string(&self.notifications.notifications) {
@@ -971,16 +1200,19 @@ impl eframe::App for App {
                     });
                 }
                 AppMsg::FileDownloaded { module_id, path } => {
+                    self.log(LogEntry::success("download", format!("Downloaded: {}", path.display())));
                     self.course_content.download_states.insert(module_id, DownloadState::Done(path.clone()));
                     self.record_activity(module_id, "downloaded");
                     let _ = open::that(&path);
                     ctx.request_repaint();
                 }
                 AppMsg::FileDownloadFailed { module_id, error } => {
+                    self.log(LogEntry::error("download", format!("Download failed (module {}): {}", module_id, error)));
                     self.course_content.download_states.insert(module_id, DownloadState::Error(error));
                     ctx.request_repaint();
                 }
                 AppMsg::NewNotifications(count) => {
+                    self.log(LogEntry::success("notification", format!("Background poller: {} new Moodle notification(s) received", count)));
                     self.notifications.unread_count += count;
                     ctx.request_repaint();
                 }
@@ -992,6 +1224,7 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 AppMsg::AssignmentUploadDone { assign_id } => {
+                    self.log(LogEntry::success("upload", format!("Assignment {} submitted successfully", assign_id)));
                     if self.assignment_detail.assignment.as_ref().map(|a| a.id) == Some(assign_id) {
                         self.assignment_detail.upload_state = UploadState::Done;
                         self.assignment_detail.pending_file = None;
@@ -1002,12 +1235,14 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 AppMsg::AssignmentUploadFailed { assign_id, error } => {
+                    self.log(LogEntry::error("upload", format!("Assignment {} upload failed: {}", assign_id, error)));
                     if self.assignment_detail.assignment.as_ref().map(|a| a.id) == Some(assign_id) {
                         self.assignment_detail.upload_state = UploadState::Error(error);
                     }
                     ctx.request_repaint();
                 }
                 AppMsg::TokenExpired => {
+                    self.log(LogEntry::warn("auth", "Session token expired — logged out"));
                     self.do_logout();
                     ctx.request_repaint();
                 }
@@ -1100,12 +1335,16 @@ impl eframe::App for App {
                                 if let Some(ev) = self.assignment_detail.show(ui) {
                                     self.handle_detail_event(ev);
                                 }
+                            } else if self.show_diff_history {
+                                if let Some(DiffHistoryEvent::Back) = self.diff_history.show(ui) {
+                                    self.show_diff_history = false;
+                                }
                             } else if let Some(selected_id) = self.courses.selected_course {
                                 let name = self.courses.courses.iter()
                                     .find(|c| c.id == selected_id)
                                     .map(|c| c.fullname.clone())
                                     .unwrap_or_else(|| "Course".into());
-                                
+
                                 egui::TopBottomPanel::top("course_content_top").show_inside(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         if ui.button("⬅ Back").clicked() {
@@ -1126,7 +1365,6 @@ impl eframe::App for App {
                                             self.download_file(module_id, url, save_path);
                                         }
                                         Some(CourseContentEvent::OpenFile(path)) => {
-                                            // Find module_id by matching path in download_states
                                             let mid = self.course_content.download_states.iter()
                                                 .find_map(|(id, ds)| match ds {
                                                     DownloadState::Done(p) if *p == path => Some(*id),
@@ -1141,7 +1379,6 @@ impl eframe::App for App {
                                                 .find(|(a, _)| a.cmid == cmid)
                                                 .map(|(a, cn)| (a.clone(), cn));
                                             if let Some((assign, course_name)) = found {
-                                                // Stay on Courses tab — Back returns to course content
                                                 self.open_assignment_detail(assign, course_name, DetailSource::CourseContent);
                                             } else {
                                                 if !self.assignments_loaded {
@@ -1158,12 +1395,50 @@ impl eframe::App for App {
                                                 .unwrap_or(path);
                                             let _ = open::that(&folder);
                                         }
+                                        Some(CourseContentEvent::OpenDiffHistory) => {
+                                            let course_id = self.course_content.course_id;
+                                            let course_name = self.courses.courses.iter()
+                                                .find(|c| c.id == course_id)
+                                                .map(|c| c.shortname.clone())
+                                                .unwrap_or_default();
+                                            if let Ok(all) = self.storage.changes_by_course_all(course_id) {
+                                                let groups = group_into_snapshots(all);
+                                                let last = groups.len().checked_sub(1);
+                                                self.diff_history = DiffHistoryScreen {
+                                                    course_id,
+                                                    course_name,
+                                                    selected_group: last,
+                                                    groups,
+                                                    ..DiffHistoryScreen::default()
+                                                };
+                                                self.show_diff_history = true;
+                                            }
+                                        }
                                         None => {}
                                     }
                                 });
                             } else {
                                 if let Some(ev) = self.courses.show(ui) { self.on_course_event(ev); }
                             }
+                        }
+                        Tab::Changes => {
+                            if !self.changes_feed_loaded {
+                                if let Ok(changes) = self.storage.all_recent_changes(200) {
+                                    let course_names: std::collections::HashMap<u64, String> =
+                                        self.courses.courses.iter()
+                                            .map(|c| (c.id, c.fullname.clone()))
+                                            .collect();
+                                    self.changes_feed.load(changes, course_names);
+                                    self.changes_feed_loaded = true;
+                                }
+                            }
+                            self.changes_feed.show(ui);
+                        }
+                        Tab::Log => {
+                            let entries = &self.log_entries;
+                            // need to pass borrow — clone ref through local
+                            let entries_ref: &[LogEntry] = entries;
+                            self.activity_log_screen.show(ui, entries_ref);
                         }
                         Tab::Announcements => { self.announcements.show(ui); }
                         Tab::Assignments  => {

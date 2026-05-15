@@ -14,6 +14,7 @@ pub enum CourseContentEvent {
     Download { module_id: u64, url: String, save_path: PathBuf },
     OpenFile(PathBuf),
     ShowFolder(PathBuf),
+    OpenDiffHistory,
 }
 
 #[derive(Clone)]
@@ -32,6 +33,7 @@ pub struct CourseContentScreen {
     pub download_states: HashMap<u64, DownloadState>,
     pub recent_changes: Vec<ContentChange>,
     pub show_changes: bool,
+    pub expanded_change_ids: std::collections::HashSet<i64>,
 }
 
 impl Default for CourseContentScreen {
@@ -45,6 +47,7 @@ impl Default for CourseContentScreen {
             download_states: HashMap::new(),
             recent_changes: vec![],
             show_changes: false,
+            expanded_change_ids: Default::default(),
         }
     }
 }
@@ -185,22 +188,28 @@ impl CourseContentScreen {
 
         // ── What's New panel ─────────────────────────────────────────────────
         if self.show_changes && !self.recent_changes.is_empty() {
-            egui::TopBottomPanel::top("whats_new_panel").show_inside(ui, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(
-                        format!("{} What's New  ({} changes)", egui_phosphor::regular::BELL_RINGING, self.recent_changes.len()))
-                        .size(13.0).strong().color(egui::Color32::from_rgb(255, 200, 60)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕ Dismiss").clicked() {
-                            self.show_changes = false;
-                        }
+            let mut dismiss_changes = false;
+            let mut to_toggle: Vec<i64> = vec![];
+            let mut open_history = false;
+            {
+                let recent_changes = &self.recent_changes;
+                let expanded_ids = &self.expanded_change_ids;
+                egui::TopBottomPanel::top("whats_new_panel").show_inside(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(
+                            format!("{} What's New  ({} changes)", egui_phosphor::regular::BELL_RINGING, recent_changes.len()))
+                            .size(13.0).strong().color(egui::Color32::from_rgb(255, 200, 60)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕ Dismiss").clicked() {
+                                dismiss_changes = true;
+                            }
+                        });
                     });
-                });
-                ui.add_space(2.0);
-                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                    for ch in &self.recent_changes {
-                        ui.horizontal(|ui| {
+                    ui.add_space(2.0);
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                        for ch in recent_changes {
+                            let is_expanded = expanded_ids.contains(&ch.id);
                             let (icon, color) = match ch.change_type.as_str() {
                                 "added"        => (egui_phosphor::regular::PLUS_CIRCLE, egui::Color32::from_rgb(80, 200, 80)),
                                 "removed"      => (egui_phosphor::regular::MINUS_CIRCLE, egui::Color32::from_rgb(200, 80, 80)),
@@ -208,58 +217,136 @@ impl CourseContentScreen {
                                 "file_updated" => (egui_phosphor::regular::ARROW_CLOCKWISE, egui::Color32::from_rgb(255, 180, 60)),
                                 _              => (egui_phosphor::regular::DOT, ui.visuals().weak_text_color()),
                             };
-                            ui.label(egui::RichText::new(icon).color(color).size(12.0));
-                            ui.label(egui::RichText::new(&ch.module_name).size(12.0));
-                            if !ch.section_name.is_empty() {
-                                ui.label(egui::RichText::new(format!("— {}", ch.section_name))
-                                    .size(11.0).color(ui.visuals().weak_text_color()));
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new(fmt_time_ago(ch.detected_at))
-                                    .size(10.0).color(ui.visuals().weak_text_color()));
-                                match ch.change_type.as_str() {
-                                    "renamed" => {
-                                        ui.label(egui::RichText::new(
-                                            format!("{} → {}", ch.old_val, ch.new_val))
-                                            .size(10.0).color(egui::Color32::from_rgb(150, 180, 255)));
-                                    }
-                                    "file_updated" => {
-                                        ui.label(egui::RichText::new(
-                                            format!("{} → {}", ch.old_val, ch.new_val))
-                                            .size(10.0).color(egui::Color32::from_rgb(255, 180, 60)));
-                                    }
-                                    _ => {}
-                                }
-                            });
-                            // Inline diff for description_updated
-                            if ch.change_type == "description_updated" {
-                                ui.add_space(2.0);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 60))
-                                    .rounding(3.0)
-                                    .inner_margin(egui::Margin::symmetric(6.0, 3.0))
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        for line in ch.new_val.lines() {
-                                            if line.starts_with("+ ") {
-                                                ui.label(egui::RichText::new(line)
-                                                    .size(10.5).monospace()
-                                                    .background_color(egui::Color32::from_rgba_premultiplied(0, 80, 0, 100))
-                                                    .color(egui::Color32::from_rgb(120, 220, 120)));
-                                            } else if line.starts_with("- ") {
-                                                ui.label(egui::RichText::new(line)
-                                                    .size(10.5).monospace()
-                                                    .background_color(egui::Color32::from_rgba_premultiplied(80, 0, 0, 100))
-                                                    .color(egui::Color32::from_rgb(220, 100, 100)));
-                                            }
+
+                            let frame_resp = egui::Frame::none()
+                                .fill(if is_expanded {
+                                    egui::Color32::from_rgba_premultiplied(30, 30, 50, 60)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .rounding(4.0)
+                                .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(icon).color(color).size(12.0));
+                                        ui.label(egui::RichText::new(&ch.module_name).size(12.0));
+                                        if !ch.section_name.is_empty() {
+                                            ui.label(egui::RichText::new(format!("— {}", ch.section_name))
+                                                .size(11.0).color(ui.visuals().weak_text_color()));
                                         }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new(if is_expanded { "▲" } else { "▼" })
+                                                .size(9.0).color(ui.visuals().weak_text_color()));
+                                            ui.label(egui::RichText::new(fmt_time_ago(ch.detected_at))
+                                                .size(10.0).color(ui.visuals().weak_text_color()));
+                                            match ch.change_type.as_str() {
+                                                "renamed" => {
+                                                    ui.label(egui::RichText::new(
+                                                        format!("{} → {}", ch.old_val, ch.new_val))
+                                                        .size(10.0).color(egui::Color32::from_rgb(150, 180, 255)));
+                                                }
+                                                "file_updated" => {
+                                                    ui.label(egui::RichText::new(
+                                                        format!("{} → {}", ch.old_val, ch.new_val))
+                                                        .size(10.0).color(egui::Color32::from_rgb(255, 180, 60)));
+                                                }
+                                                _ => {}
+                                            }
+                                        });
                                     });
+
+                                    if is_expanded {
+                                        ui.add_space(2.0);
+                                        match ch.change_type.as_str() {
+                                            "description_updated" => {
+                                                egui::Frame::none()
+                                                    .fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 60))
+                                                    .rounding(3.0)
+                                                    .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                                                    .show(ui, |ui| {
+                                                        ui.set_min_width(ui.available_width());
+                                                        let diff = crate::telemetry::text_diff(&ch.old_val, &ch.new_val);
+                                                        if diff.is_empty() {
+                                                            ui.label(egui::RichText::new("(no text changes)")
+                                                                .size(10.0).color(ui.visuals().weak_text_color()));
+                                                        } else {
+                                                            for line in diff.lines() {
+                                                                if line.starts_with("+ ") {
+                                                                    ui.label(egui::RichText::new(line)
+                                                                        .size(10.5).monospace()
+                                                                        .background_color(egui::Color32::from_rgba_premultiplied(0, 80, 0, 100))
+                                                                        .color(egui::Color32::from_rgb(120, 220, 120)));
+                                                                } else if line.starts_with("- ") {
+                                                                    ui.label(egui::RichText::new(line)
+                                                                        .size(10.5).monospace()
+                                                                        .background_color(egui::Color32::from_rgba_premultiplied(80, 0, 0, 100))
+                                                                        .color(egui::Color32::from_rgb(220, 100, 100)));
+                                                                }
+                                                            }
+                                                        }
+                                                    });
+                                            }
+                                            "renamed" => {
+                                                ui.label(egui::RichText::new(
+                                                    format!("Renamed: \"{}\" → \"{}\"", ch.old_val, ch.new_val))
+                                                    .size(11.0).color(egui::Color32::from_rgb(150, 180, 255)));
+                                            }
+                                            "file_updated" => {
+                                                ui.label(egui::RichText::new(
+                                                    format!("Size: {} → {}", ch.old_val, ch.new_val))
+                                                    .size(11.0).color(egui::Color32::from_rgb(255, 180, 60)));
+                                            }
+                                            "added" => {
+                                                ui.label(egui::RichText::new(
+                                                    format!("Added in \"{}\"", ch.section_name))
+                                                    .size(11.0).color(egui::Color32::from_rgb(80, 200, 80)));
+                                            }
+                                            "removed" => {
+                                                ui.label(egui::RichText::new(
+                                                    format!("Removed from \"{}\"", ch.section_name))
+                                                    .size(11.0).color(egui::Color32::from_rgb(200, 80, 80)));
+                                            }
+                                            _ => {}
+                                        }
+                                        ui.add_space(2.0);
+                                    }
+                                });
+
+                            let click_resp = ui.interact(
+                                frame_resp.response.rect,
+                                egui::Id::new(("change_click", ch.id)),
+                                egui::Sense::click(),
+                            );
+                            if click_resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
-                        });
-                    }
+                            if click_resp.clicked() {
+                                to_toggle.push(ch.id);
+                            }
+                        }
+
+                        ui.add_space(2.0);
+                        ui.separator();
+                        ui.add_space(2.0);
+                        if ui.small_button("View full diff history…").clicked() {
+                            open_history = true;
+                        }
+                    });
+                    ui.add_space(4.0);
                 });
-                ui.add_space(4.0);
-            });
+            }
+            if dismiss_changes { self.show_changes = false; }
+            for id in to_toggle {
+                if self.expanded_change_ids.contains(&id) {
+                    self.expanded_change_ids.remove(&id);
+                } else {
+                    self.expanded_change_ids.insert(id);
+                }
+            }
+            if open_history {
+                event = Some(CourseContentEvent::OpenDiffHistory);
+            }
         }
 
         // ── Main scroll area ─────────────────────────────────────────────────

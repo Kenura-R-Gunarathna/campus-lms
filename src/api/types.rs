@@ -99,6 +99,14 @@ pub struct CourseModule {
     /// Full HTML content (only present when returncontents=1, e.g. "page" modules)
     #[serde(deserialize_with = "de_false_as_none", default)]
     pub mainpage: Option<String>,
+    #[serde(default)]
+    pub dates: Vec<ModuleDate>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ModuleDate {
+    pub label: String,
+    pub timestamp: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -109,6 +117,8 @@ pub struct ModuleContent {
     pub fileurl: String,
     #[serde(deserialize_with = "de_false_as_zero_u64", default)]
     pub filesize: u64,
+    #[serde(deserialize_with = "de_false_as_zero_u64", default)]
+    pub timemodified: u64,
     #[serde(deserialize_with = "de_false_as_none", default)]
     pub mimetype: Option<String>,
 }

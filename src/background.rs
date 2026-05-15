@@ -4,7 +4,7 @@ use crate::storage::Storage;
 const NOTIF_POLL_SECS: u64 = 600;   // 10 min
 const CONTENT_POLL_SECS: u64 = 1800; // 30 min
 
-fn desktop_notify(title: &str, body: &str) {
+pub fn desktop_notify(title: &str, body: &str) {
     let _ = notify_rust::Notification::new()
         .summary(title)
         .body(body)
@@ -105,12 +105,11 @@ async fn poll_content_changes(token: &str, storage: &Storage) {
             Err(_) => continue,
         };
 
-        let stored = match storage.load_fingerprints(course.id) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let stored_mods = storage.load_fingerprints(course.id).unwrap_or_default();
+        let stored_secs = storage.load_section_fingerprints(course.id).unwrap_or_default();
 
-        let (changes, new_fps, removed_ids) = crate::telemetry::diff_content(course.id, &sections, &stored);
+        let (changes, new_mods, new_secs, rem_mods, rem_secs) = 
+            crate::telemetry::diff_content(course.id, &sections, &stored_mods, &stored_secs);
 
         if !changes.is_empty() {
             total_changes += changes.len();
@@ -118,8 +117,10 @@ async fn poll_content_changes(token: &str, storage: &Storage) {
             let _ = storage.save_changes(&changes);
         }
 
-        let _ = storage.upsert_fingerprints(course.id, &new_fps);
-        let _ = storage.delete_fingerprints(&removed_ids);
+        let _ = storage.upsert_fingerprints(course.id, &new_mods);
+        let _ = storage.upsert_section_fingerprints(course.id, &new_secs);
+        let _ = storage.delete_fingerprints(&rem_mods);
+        let _ = storage.delete_section_fingerprints(&rem_secs);
 
         // Small delay to avoid hammering the server
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -137,7 +138,53 @@ async fn poll_content_changes(token: &str, storage: &Storage) {
     }
 }
 
+pub fn is_dev_binary() -> bool {
+    std::env::current_exe().map(|p| {
+        let s = p.to_string_lossy();
+        s.contains("/target/debug/") || s.contains("/tmp/")
+            || (s.contains("/target/release/") && s.contains("/deps/"))
+    }).unwrap_or(false)
+}
+
+pub struct DaemonStatus {
+    pub desktop_file_exists: bool,
+    pub desktop_exe_path: Option<String>,
+    pub current_exe_path: String,
+    pub paths_match: bool,
+    pub is_dev_binary: bool,
+}
+
+pub fn daemon_status() -> DaemonStatus {
+    let current_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let desktop_path = dirs_next::config_dir()
+        .map(|d| d.join("autostart").join("campus-lms.desktop"));
+    let desktop_file_exists = desktop_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let desktop_exe_path = desktop_path
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|contents| {
+            contents.lines()
+                .find(|l| l.starts_with("Exec="))
+                .map(|l| l["Exec=".len()..].trim().trim_end_matches(" --background").to_string())
+        });
+    let paths_match = desktop_exe_path.as_deref() == Some(current_exe.as_str());
+    DaemonStatus {
+        desktop_file_exists,
+        paths_match,
+        desktop_exe_path,
+        current_exe_path: current_exe,
+        is_dev_binary: is_dev_binary(),
+    }
+}
+
 pub fn create_autostart() -> std::io::Result<()> {
+    if is_dev_binary() {
+        return Err(std::io::Error::other(
+            "Dev binary detected. Build with `cargo build --release` and install \
+             to a stable path (e.g. ~/.local/bin/campus-lms) first."
+        ));
+    }
     let exe = std::env::current_exe()?;
     let dir = dirs_next::config_dir()
         .ok_or_else(|| std::io::Error::other("no config dir"))?

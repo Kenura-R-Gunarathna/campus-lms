@@ -4,7 +4,26 @@ use anyhow::{anyhow, bail};
 use reqwest::Client;
 use types::*;
 
-const BASE: &str = "https://sci.cmb.ac.lk/lms";
+pub const DEFAULT_BASE: &str = "https://sci.cmb.ac.lk/lms";
+
+static RUNTIME_BASE: std::sync::OnceLock<std::sync::RwLock<String>> = std::sync::OnceLock::new();
+
+fn effective_base() -> String {
+    RUNTIME_BASE.get_or_init(|| {
+        let v = std::env::var("CAMPUS_LMS_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_BASE.into());
+        std::sync::RwLock::new(v)
+    }).read().unwrap().clone()
+}
+
+pub fn set_moodle_base(url: String) {
+    let lock = RUNTIME_BASE.get_or_init(|| std::sync::RwLock::new(url.clone()));
+    *lock.write().unwrap() = url;
+}
+
+pub fn get_moodle_base() -> String {
+    effective_base()
+}
 
 #[derive(Clone)]
 pub struct MoodleClient {
@@ -14,9 +33,10 @@ pub struct MoodleClient {
 
 impl MoodleClient {
     pub async fn login(username: &str, password: &str) -> anyhow::Result<(String, String, SiteInfo)> {
+        let base = effective_base();
         let http = Client::new();
         let resp: TokenResponse = http
-            .post(format!("{BASE}/login/token.php"))
+            .post(format!("{base}/login/token.php"))
             .form(&[
                 ("username", username),
                 ("password", password),
@@ -46,7 +66,7 @@ impl MoodleClient {
 
     pub async fn site_info(&self) -> anyhow::Result<SiteInfo> {
         let info: SiteInfo = self.http
-            .get(format!("{BASE}/webservice/rest/server.php"))
+            .get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&self.base_params("core_webservice_get_site_info"))
             .send().await?.json().await?;
         if let Some(code) = &info.errorcode { bail!("token_invalid:{code}"); }
@@ -56,14 +76,14 @@ impl MoodleClient {
     pub async fn get_autologin_url(&self, privatetoken: &str) -> anyhow::Result<AutoLoginResponse> {
         let mut p = self.base_params("tool_mobile_get_autologin_key");
         p.push(("privatetoken".into(), privatetoken.into()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
     pub async fn enrolled_courses(&self, userid: u64) -> anyhow::Result<Vec<Course>> {
         let mut p = self.base_params("core_enrol_get_users_courses");
         p.push(("userid".into(), userid.to_string()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
@@ -82,7 +102,7 @@ impl MoodleClient {
             p.push(("options[0][name]".into(), "returncontents".into()));
             p.push(("options[0][value]".into(), "1".into()));
         }
-        let text = self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        let text = self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.text().await?;
         if text.trim_start().starts_with('{') {
             let v: serde_json::Value = serde_json::from_str(&text)?;
@@ -100,14 +120,14 @@ impl MoodleClient {
         for (i, id) in course_ids.iter().enumerate() {
             p.push((format!("courseids[{i}]"), id.to_string()));
         }
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
     pub async fn submission_status(&self, assign_id: u64) -> anyhow::Result<SubmissionStatusResponse> {
         let mut p = self.base_params("mod_assign_get_submission_status");
         p.push(("assignid".into(), assign_id.to_string()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
@@ -124,7 +144,7 @@ impl MoodleClient {
             .text("filename", filename.to_string())
             .part("file_1", part);
         let resp: serde_json::Value = self.http
-            .post(format!("{BASE}/webservice/upload.php"))
+            .post(format!("{}/webservice/upload.php", effective_base()))
             .multipart(form)
             .send().await?.json().await?;
         // API returns an array with one item
@@ -142,7 +162,7 @@ impl MoodleClient {
         p.push(("assignmentid".into(), assign_id.to_string()));
         p.push(("plugindata[files_filemanager]".into(), itemid.to_string()));
         let _: serde_json::Value = self.http
-            .post(format!("{BASE}/webservice/rest/server.php"))
+            .post(format!("{}/webservice/rest/server.php", effective_base()))
             .form(&p).send().await?.json().await?;
         Ok(())
     }
@@ -153,7 +173,7 @@ impl MoodleClient {
         p.push(("assignmentid".into(), assign_id.to_string()));
         p.push(("acceptsubmissionstatement".into(), "1".into()));
         let _: serde_json::Value = self.http
-            .post(format!("{BASE}/webservice/rest/server.php"))
+            .post(format!("{}/webservice/rest/server.php", effective_base()))
             .form(&p).send().await?.json().await?;
         Ok(())
     }
@@ -163,7 +183,7 @@ impl MoodleClient {
         for (i, id) in course_ids.iter().enumerate() {
             p.push((format!("courseids[{i}]"), id.to_string()));
         }
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
@@ -171,7 +191,7 @@ impl MoodleClient {
         let mut p = self.base_params("mod_forum_get_forum_discussions_paginated");
         p.push(("forumid".into(), forum_id.to_string()));
         p.push(("perpage".into(), "20".into()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
@@ -180,7 +200,7 @@ impl MoodleClient {
         p.push(("timesortfrom".into(), from.to_string()));
         p.push(("timesortto".into(), to.to_string()));
         p.push(("limitnum".into(), "200".into()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
@@ -189,7 +209,7 @@ impl MoodleClient {
         p.push(("useridto".into(), userid.to_string()));
         p.push(("offset".into(), offset.to_string()));
         p.push(("limit".into(), "50".into()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
@@ -198,7 +218,7 @@ impl MoodleClient {
         p.push(("field".into(), "id".into()));
         p.push(("values[0]".into(), userid.to_string()));
         let users: Vec<UserProfile> = self.http
-            .get(format!("{BASE}/webservice/rest/server.php"))
+            .get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?;
         users.into_iter().next().ok_or_else(|| anyhow::anyhow!("Profile not found"))
     }
@@ -206,7 +226,7 @@ impl MoodleClient {
     pub async fn grades_overview(&self, userid: u64) -> anyhow::Result<GradeOverviewResponse> {
         let mut p = self.base_params("gradereport_overview_get_course_grades");
         p.push(("userid".into(), userid.to_string()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 
@@ -214,7 +234,7 @@ impl MoodleClient {
         let mut p = self.base_params("gradereport_user_get_grade_items");
         p.push(("userid".into(), userid.to_string()));
         p.push(("courseid".into(), course_id.to_string()));
-        Ok(self.http.get(format!("{BASE}/webservice/rest/server.php"))
+        Ok(self.http.get(format!("{}/webservice/rest/server.php", effective_base()))
             .query(&p).send().await?.json().await?)
     }
 }

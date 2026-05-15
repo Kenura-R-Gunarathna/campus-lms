@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod background;
+mod log;
 mod models;
 mod screens;
 mod storage;

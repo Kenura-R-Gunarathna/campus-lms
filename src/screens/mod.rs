@@ -1,4 +1,7 @@
+pub mod activity_log;
 pub mod assignment_detail;
+pub mod changes_feed;
+pub mod diff_history;
 pub mod assignments;
 pub mod calendar;
 pub mod courses;

@@ -7,6 +7,7 @@ pub struct Storage {
 
 #[derive(Clone)]
 pub struct ContentChange {
+    pub id: i64,
     pub course_id: u64,
     pub module_id: u64,
     pub module_name: String,
@@ -21,9 +22,14 @@ pub struct ContentChange {
 pub struct StoredFingerprint {
     pub module_id: u64,
     pub name: String,
-    pub filesize: i64,
-    pub fileurl: String,
-    pub description: String,
+    pub content_hash: String,
+}
+
+#[derive(Clone)]
+pub struct StoredSectionFingerprint {
+    pub section_id: u64,
+    pub name: String,
+    pub summary_hash: String,
 }
 
 #[derive(Clone)]
@@ -45,6 +51,15 @@ impl Storage {
             .join("data.db");
         std::fs::create_dir_all(path.parent().unwrap()).ok();
         let conn = Connection::open(path)?;
+
+        // Migration: Reset fingerprints to switch to Hash-Based strategy
+        let has_old_schema = conn.prepare("SELECT * FROM content_fingerprints LIMIT 0")
+            .and_then(|stmt| Ok(stmt.column_names().contains(&"filesize")))
+            .unwrap_or(false);
+        if has_old_schema {
+            conn.execute("DROP TABLE content_fingerprints", [])?;
+        }
+
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS session (
                 key TEXT PRIMARY KEY,
@@ -65,9 +80,13 @@ impl Storage {
                 module_id    INTEGER PRIMARY KEY,
                 course_id    INTEGER NOT NULL,
                 name         TEXT NOT NULL,
-                filesize     INTEGER NOT NULL DEFAULT 0,
-                fileurl      TEXT NOT NULL DEFAULT '',
-                description  TEXT NOT NULL DEFAULT ''
+                content_hash TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS section_fingerprints (
+                section_id   INTEGER PRIMARY KEY,
+                course_id    INTEGER NOT NULL,
+                name         TEXT NOT NULL,
+                summary_hash TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS content_changes (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,16 +200,14 @@ impl Storage {
 
     pub fn load_fingerprints(&self, course_id: u64) -> Result<Vec<StoredFingerprint>> {
         let mut stmt = self.conn.prepare(
-            "SELECT module_id, name, filesize, fileurl, description
+            "SELECT module_id, name, content_hash
              FROM content_fingerprints WHERE course_id = ?1"
         )?;
         let rows = stmt.query_map(params![course_id as i64], |r| {
             Ok(StoredFingerprint {
                 module_id: r.get::<_, i64>(0)? as u64,
                 name: r.get(1)?,
-                filesize: r.get(2)?,
-                fileurl: r.get(3)?,
-                description: r.get(4)?,
+                content_hash: r.get(2)?,
             })
         })?;
         rows.collect()
@@ -200,10 +217,9 @@ impl Storage {
         for fp in fps {
             self.conn.execute(
                 "INSERT OR REPLACE INTO content_fingerprints
-                 (module_id, course_id, name, filesize, fileurl, description)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![fp.module_id as i64, course_id as i64,
-                        fp.name, fp.filesize, fp.fileurl, fp.description],
+                 (module_id, course_id, name, content_hash)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![fp.module_id as i64, course_id as i64, fp.name, fp.content_hash],
             )?;
         }
         Ok(())
@@ -213,6 +229,43 @@ impl Storage {
         for &id in module_ids {
             self.conn.execute(
                 "DELETE FROM content_fingerprints WHERE module_id = ?1",
+                params![id as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn load_section_fingerprints(&self, course_id: u64) -> Result<Vec<StoredSectionFingerprint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT section_id, name, summary_hash
+             FROM section_fingerprints WHERE course_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![course_id as i64], |r| {
+            Ok(StoredSectionFingerprint {
+                section_id: r.get::<_, i64>(0)? as u64,
+                name: r.get(1)?,
+                summary_hash: r.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn upsert_section_fingerprints(&self, course_id: u64, fps: &[StoredSectionFingerprint]) -> Result<()> {
+        for fp in fps {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO section_fingerprints
+                 (section_id, course_id, name, summary_hash)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![fp.section_id as i64, course_id as i64, fp.name, fp.summary_hash],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_section_fingerprints(&self, section_ids: &[u64]) -> Result<()> {
+        for &id in section_ids {
+            self.conn.execute(
+                "DELETE FROM section_fingerprints WHERE section_id = ?1",
                 params![id as i64],
             )?;
         }
@@ -261,21 +314,68 @@ impl Storage {
 
     pub fn recent_changes(&self, course_id: u64, limit: usize) -> Result<Vec<ContentChange>> {
         let mut stmt = self.conn.prepare(
-            "SELECT course_id, module_id, module_name, section_name,
+            "SELECT id, course_id, module_id, module_name, section_name,
                     change_type, old_val, new_val, detected_at
              FROM content_changes WHERE course_id = ?1
              ORDER BY detected_at DESC LIMIT ?2"
         )?;
         let rows = stmt.query_map(params![course_id as i64, limit as i64], |r| {
             Ok(ContentChange {
-                course_id: r.get::<_, i64>(0)? as u64,
-                module_id: r.get::<_, i64>(1)? as u64,
-                module_name: r.get(2)?,
-                section_name: r.get(3)?,
-                change_type: r.get(4)?,
-                old_val: r.get(5)?,
-                new_val: r.get(6)?,
-                detected_at: r.get(7)?,
+                id: r.get::<_, i64>(0)?,
+                course_id: r.get::<_, i64>(1)? as u64,
+                module_id: r.get::<_, i64>(2)? as u64,
+                module_name: r.get(3)?,
+                section_name: r.get(4)?,
+                change_type: r.get(5)?,
+                old_val: r.get(6)?,
+                new_val: r.get(7)?,
+                detected_at: r.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn changes_by_course_all(&self, course_id: u64) -> Result<Vec<ContentChange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, course_id, module_id, module_name, section_name,
+                    change_type, old_val, new_val, detected_at
+             FROM content_changes WHERE course_id = ?1
+             ORDER BY detected_at ASC"
+        )?;
+        let rows = stmt.query_map(params![course_id as i64], |r| {
+            Ok(ContentChange {
+                id: r.get::<_, i64>(0)?,
+                course_id: r.get::<_, i64>(1)? as u64,
+                module_id: r.get::<_, i64>(2)? as u64,
+                module_name: r.get(3)?,
+                section_name: r.get(4)?,
+                change_type: r.get(5)?,
+                old_val: r.get(6)?,
+                new_val: r.get(7)?,
+                detected_at: r.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn all_recent_changes(&self, limit: usize) -> Result<Vec<ContentChange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, course_id, module_id, module_name, section_name,
+                    change_type, old_val, new_val, detected_at
+             FROM content_changes
+             ORDER BY detected_at DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(ContentChange {
+                id: r.get::<_, i64>(0)?,
+                course_id: r.get::<_, i64>(1)? as u64,
+                module_id: r.get::<_, i64>(2)? as u64,
+                module_name: r.get(3)?,
+                section_name: r.get(4)?,
+                change_type: r.get(5)?,
+                old_val: r.get(6)?,
+                new_val: r.get(7)?,
+                detected_at: r.get(8)?,
             })
         })?;
         rows.collect()
@@ -323,6 +423,7 @@ impl Storage {
     pub fn clear_telemetry(&self) -> Result<()> {
         self.conn.execute_batch("
             DELETE FROM content_fingerprints;
+            DELETE FROM section_fingerprints;
             DELETE FROM content_changes;
             DELETE FROM user_activity;
         ")?;
