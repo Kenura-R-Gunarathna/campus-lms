@@ -33,7 +33,7 @@ aur-push: aur-sync
 	@echo "Committing and pushing to AUR..."
 	cd $(AUR_DIR) && \
 	git add PKGBUILD .SRCINFO campus-lms.desktop campus-lms-daemon.service && \
-	git commit -m "Update to latest version" && \
+	(git diff --cached --quiet || git commit -m "Update to latest version") && \
 	git push origin master
 
 .PHONY: push-all
