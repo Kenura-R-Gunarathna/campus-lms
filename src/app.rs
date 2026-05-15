@@ -118,6 +118,7 @@ pub struct App {
     // Diff history
     diff_history: DiffHistoryScreen,
     show_diff_history: bool,
+    show_bg_suggestion: bool,
     tx: Sender<AppMsg>,
     rx: Receiver<AppMsg>,
 }
@@ -174,6 +175,7 @@ impl App {
             changes_feed_loaded: false,
             diff_history: DiffHistoryScreen::default(),
             show_diff_history: false,
+            show_bg_suggestion: false,
             tx,
             rx,
         };
@@ -967,6 +969,7 @@ impl eframe::App for App {
                     self.fullname = info.fullname;
                     self.login.loading = false;
                     self.screen = Screen::Main;
+                    self.show_bg_suggestion = !self.bg_enabled;
                     let tx = self.tx.clone();
                     let t2 = token.clone();
                     let uid = self.userid;
@@ -1485,6 +1488,31 @@ impl eframe::App for App {
                             }
                         }
                         Tab::Profile => { self.profile.show(ui); }
+                    }
+
+                    if self.show_bg_suggestion {
+                        let mut open = true;
+                        egui::Window::new("💡 Recommended")
+                            .open(&mut open)
+                            .anchor(egui::Align2::RIGHT_BOTTOM, egui::Vec2::new(-20.0, -20.0))
+                            .resizable(false)
+                            .collapsible(false)
+                            .show(ui.ctx(), |ui| {
+                                ui.set_max_width(220.0);
+                                ui.label("Enable background notifications to stay updated without keeping the app open.");
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Enable now").clicked() {
+                                        self.bg_enabled = true;
+                                        let _ = background::create_autostart();
+                                        self.show_bg_suggestion = false;
+                                    }
+                                    if ui.button("Later").clicked() {
+                                        self.show_bg_suggestion = false;
+                                    }
+                                });
+                            });
+                        if !open { self.show_bg_suggestion = false; }
                     }
                 });
             }
