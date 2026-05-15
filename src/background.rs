@@ -243,7 +243,7 @@ pub fn create_autostart() -> std::io::Result<()> {
         let hkcu = winreg::enums::HKEY_CURRENT_USER;
         let path = r"Software\Microsoft\Windows\CurrentVersion\Run";
         let reg = winreg::RegKey::predef(hkcu);
-        let key = reg.create_subkey(path)?;
+        let (key, _) = reg.create_subkey(path)?;
         let cmd = format!("\"{}\" --background", exe.display());
         key.set_value("CampusLMS", &cmd)?;
     }
