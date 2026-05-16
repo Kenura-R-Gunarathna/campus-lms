@@ -21,10 +21,6 @@ pub fn set_moodle_base(url: String) {
     *lock.write().unwrap() = url;
 }
 
-pub fn get_moodle_base() -> String {
-    effective_base()
-}
-
 #[derive(Clone)]
 pub struct MoodleClient {
     http: Client,

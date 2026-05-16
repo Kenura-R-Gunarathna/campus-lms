@@ -12,7 +12,7 @@ pub struct SnapshotGroup {
 }
 
 pub struct DiffHistoryScreen {
-    pub course_id: u64,
+    pub _course_id: u64,
     pub course_name: String,
     pub groups: Vec<SnapshotGroup>,
     pub selected_group: Option<usize>,
@@ -25,7 +25,7 @@ pub struct DiffHistoryScreen {
 impl Default for DiffHistoryScreen {
     fn default() -> Self {
         Self {
-            course_id: 0,
+            _course_id: 0,
             course_name: String::new(),
             groups: vec![],
             selected_group: None,

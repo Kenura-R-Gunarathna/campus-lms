@@ -43,3 +43,5 @@ Format: `[version] - date — description`
 - Async HTTP via reqwest + tokio
 - Login screen with email/password fields
 - Token-based auth (moodle_mobile_app service)
+
+

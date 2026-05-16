@@ -1439,7 +1439,7 @@ impl eframe::App for App {
                                                 let groups = group_into_snapshots(all);
                                                 let last = groups.len().checked_sub(1);
                                                 self.diff_history = DiffHistoryScreen {
-                                                    course_id,
+                                                    _course_id: course_id,
                                                     course_name,
                                                     selected_group: last,
                                                     groups,
