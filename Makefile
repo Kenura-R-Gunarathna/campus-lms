@@ -54,6 +54,15 @@ push-all:
 .PHONY: release
 release:
 	@if [ -z "$(v)" ]; then echo "Error: Provide a version, e.g., make release v=1.0.0"; exit 1; fi
+	@if ! git diff --quiet || ! git diff --cached --quiet; then \
+		echo "Error: working tree has uncommitted changes. Commit or stash first."; exit 1; \
+	fi
+	@echo "Bumping Cargo.toml to v$(v)..."
+	sed -i '1,10 s/^version = ".*"/version = "$(v)"/' Cargo.toml
+	cargo check --offline >/dev/null 2>&1 || cargo check >/dev/null 2>&1
+	git add Cargo.toml Cargo.lock
+	git commit -m "chore: bump version to v$(v)"
+	git push origin main
 	git tag -a v$(v) -m "Release v$(v)"
 	git push origin v$(v)
 	@echo ""
