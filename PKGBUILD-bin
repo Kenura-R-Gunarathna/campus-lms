@@ -20,9 +20,11 @@ source=(
     "campus-lms::${url}/releases/download/v${pkgver}/campus-lms-linux-x86_64"
     "campus-lms.desktop"
     "campus-lms-daemon.service"
+    "campus-lms.png"
 )
 sha256sums=(
     'c74a695fe165ada3ef5eeafb0373859665a39626e2e501a3556064d4b31a89c8'
+    'SKIP'
     'SKIP'
     'SKIP'
 )
@@ -36,4 +38,7 @@ package() {
 
     install -Dm644 "${srcdir}/campus-lms-daemon.service" \
         "${pkgdir}/usr/lib/systemd/user/campus-lms-daemon.service"
+
+    install -Dm644 "${srcdir}/campus-lms.png" \
+        "${pkgdir}/usr/share/icons/hicolor/512x512/apps/campus-lms.png"
 }

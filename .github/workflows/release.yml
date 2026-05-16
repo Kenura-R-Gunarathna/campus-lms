@@ -94,28 +94,47 @@ jobs:
           echo "sha256=$(sha256sum /tmp/binary/campus-lms-linux-x86_64 | cut -d' ' -f1)" >> $GITHUB_OUTPUT
           echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Generate PKGBUILD for campus-lms-bin
+      - name: Setup SSH for AUR
         run: |
-          mkdir -p /tmp/aur-bin
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          ssh-keyscan -t ed25519,rsa aur.archlinux.org >> ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur_key
+            User aur
+            StrictHostKeyChecking accept-new
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Push campus-lms-bin to AUR
+        run: |
+          git config --global user.email "kenura.gunarathna@thenex.global"
+          git config --global user.name "kenura"
+
+          git clone ssh://aur@aur.archlinux.org/campus-lms-bin.git aur-bin-repo
+
+          # Generate PKGBUILD from template
           sed -e "s/pkgver=.*/pkgver=${{ steps.meta.outputs.version }}/" \
               -e "s/sha256sums=(.*/sha256sums=(/" \
-              -e "/sha256sums=(/!b;n;c\    '${{ steps.meta.outputs.sha256 }}'" \
-              PKGBUILD-bin > /tmp/aur-bin/PKGBUILD
-          cp campus-lms.desktop campus-lms-daemon.service /tmp/aur-bin/
+              -e "/sha256sums=(/!b;n;c\\    '${{ steps.meta.outputs.sha256 }}'" \
+              PKGBUILD-bin > aur-bin-repo/PKGBUILD
+          cp campus-lms.desktop campus-lms-daemon.service aur-bin-repo/
+          cp assets/icon.png aur-bin-repo/campus-lms.png
 
-      - name: Publish campus-lms-bin to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
-        with:
-          pkgname: campus-lms-bin
-          pkgbuild: /tmp/aur-bin/PKGBUILD
-          assets: |
-            /tmp/aur-bin/campus-lms.desktop
-            /tmp/aur-bin/campus-lms-daemon.service
-          commit_username: kenura
-          commit_email: kenura.gunarathna@thenex.global
-          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
-          commit_message: "Release v${{ steps.meta.outputs.version }}"
-          ssh_keyscan_types: rsa,ed25519
+          # Generate .SRCINFO using arch container, capture stdout to host file
+          docker run --rm -v "$PWD/aur-bin-repo":/pkg:ro archlinux:base-devel bash -c '
+            mkdir -p /tmp/build && cp -r /pkg/. /tmp/build/
+            useradd -m -d /home/builder builder
+            chown -R builder:builder /tmp/build
+            su builder -c "cd /tmp/build && makepkg --printsrcinfo"
+          ' > aur-bin-repo/.SRCINFO
+
+          cd aur-bin-repo
+          git add .
+          git diff --cached --quiet || git commit -m "Release v${{ steps.meta.outputs.version }}"
+          git push origin master
 
   aur-git:
     name: Publish AUR (campus-lms-git)
@@ -125,16 +144,41 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Publish campus-lms-git to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
-        with:
-          pkgname: campus-lms-git
-          pkgbuild: ./PKGBUILD
-          assets: |
-            campus-lms.desktop
-            campus-lms-daemon.service
-          commit_username: kenura
-          commit_email: kenura.gunarathna@thenex.global
-          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
-          commit_message: "Update from release v${{ github.ref_name }}"
-          ssh_keyscan_types: rsa,ed25519
+      - name: Extract version
+        id: meta
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Setup SSH for AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          ssh-keyscan -t ed25519,rsa aur.archlinux.org >> ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur_key
+            User aur
+            StrictHostKeyChecking accept-new
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Push campus-lms-git to AUR
+        run: |
+          git config --global user.email "kenura.gunarathna@thenex.global"
+          git config --global user.name "kenura"
+
+          git clone ssh://aur@aur.archlinux.org/campus-lms-git.git aur-git-repo
+
+          cp PKGBUILD campus-lms.desktop campus-lms-daemon.service aur-git-repo/
+
+          docker run --rm -v "$PWD/aur-git-repo":/pkg:ro archlinux:base-devel bash -c '
+            mkdir -p /tmp/build && cp -r /pkg/. /tmp/build/
+            useradd -m -d /home/builder builder
+            chown -R builder:builder /tmp/build
+            su builder -c "cd /tmp/build && makepkg --printsrcinfo"
+          ' > aur-git-repo/.SRCINFO
+
+          cd aur-git-repo
+          git add .
+          git diff --cached --quiet || git commit -m "Update from release v${{ steps.meta.outputs.version }}"
+          git push origin master

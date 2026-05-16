@@ -219,7 +219,7 @@ impl CoursesScreen {
                             .size(13.0).strong();
                         ui.label(header);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let arrow = if self.show_recent { "▲" } else { "▼" };
+                            let arrow = if self.show_recent { egui_phosphor::regular::CARET_UP } else { egui_phosphor::regular::CARET_DOWN };
                             if ui.small_button(arrow).clicked() {
                                 self.show_recent = !self.show_recent;
                             }

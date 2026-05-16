@@ -32,10 +32,14 @@ async fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let icon = eframe::icon_data::from_png_bytes(&include_bytes!("../assets/icon.png")[..])
+        .expect("invalid assets/icon.png");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Campus LMS")
-            .with_inner_size([980.0, 650.0]),
+            .with_inner_size([980.0, 650.0])
+            .with_icon(icon),
         ..Default::default()
     };
 

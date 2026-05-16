@@ -301,3 +301,37 @@ pub fn check_for_updates(tx: std::sync::mpsc::Sender<crate::app::AppMsg>) {
         }
     });
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMethod {
+    PackageManager,
+    Standalone,
+    Unknown,
+}
+
+pub fn detect_install_method() -> InstallMethod {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return InstallMethod::Unknown,
+    };
+    let path = exe.to_string_lossy();
+
+    #[cfg(target_os = "linux")]
+    {
+        if path.starts_with("/usr/bin/")
+            || path.starts_with("/usr/local/bin/")
+            || path.starts_with("/opt/")
+        {
+            return InstallMethod::PackageManager;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let lower = path.to_lowercase();
+        if lower.contains("\\program files") || lower.contains("\\programdata") {
+            return InstallMethod::PackageManager;
+        }
+    }
+
+    InstallMethod::Standalone
+}

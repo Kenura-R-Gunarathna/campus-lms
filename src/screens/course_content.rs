@@ -236,7 +236,7 @@ impl CourseContentScreen {
                                                 .size(11.0).color(ui.visuals().weak_text_color()));
                                         }
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new(if is_expanded { "▲" } else { "▼" })
+                                            ui.label(egui::RichText::new(if is_expanded { egui_phosphor::regular::CARET_UP } else { egui_phosphor::regular::CARET_DOWN })
                                                 .size(9.0).color(ui.visuals().weak_text_color()));
                                             ui.label(egui::RichText::new(fmt_time_ago(ch.detected_at))
                                                 .size(10.0).color(ui.visuals().weak_text_color()));

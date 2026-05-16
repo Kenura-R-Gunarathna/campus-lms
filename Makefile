@@ -42,6 +42,7 @@ aur-push-bin:
 	    -e "/sha256sums=(/!b;n;c\    '$(sha)'" \
 	    PKGBUILD-bin > $(AUR_BIN_DIR)/PKGBUILD
 	cp campus-lms.desktop campus-lms-daemon.service $(AUR_BIN_DIR)/
+	cp assets/icon.png $(AUR_BIN_DIR)/campus-lms.png
 	cd $(AUR_BIN_DIR) && makepkg --printsrcinfo > .SRCINFO && \
 	git add . && (git diff --cached --quiet || git commit -m "Release v$(v)") && git push origin master
 
