@@ -4,7 +4,7 @@ AUR_BIN_DIR ?= $(HOME)/aur/campus-lms-bin
 
 # AUR URLs
 AUR_GIT_URL ?= https://aur.archlinux.org/campus-lms-git.git
-AUR_BIN_URL ?= https://aur.archlinux.org/campus-lms-bin.git
+AUR_BIN_URL ?= ssh://aur@aur.archlinux.org/campus-lms-bin.git
 
 .PHONY: help
 help:
@@ -55,5 +55,14 @@ release:
 	@if [ -z "$(v)" ]; then echo "Error: Provide a version, e.g., make release v=1.0.0"; exit 1; fi
 	git tag -a v$(v) -m "Release v$(v)"
 	git push origin v$(v)
-	@echo "GitHub Action is building binaries. When done, run:"
+	@echo ""
+	@echo "Tag pushed. GitHub Actions will now:"
+	@echo "  1. Build Linux + Windows binaries"
+	@echo "  2. Create GitHub Release with binaries"
+	@echo "  3. Auto-publish campus-lms-bin to AUR (with correct SHA)"
+	@echo "  4. Auto-publish campus-lms-git to AUR"
+	@echo ""
+	@echo "Watch progress: https://github.com/Kenura-R-Gunarathna/campus-lms/actions"
+	@echo ""
+	@echo "Manual fallback (only if CI fails):"
 	@echo "  make aur-push-bin v=$(v) sha=PASTE_SHA_HERE"

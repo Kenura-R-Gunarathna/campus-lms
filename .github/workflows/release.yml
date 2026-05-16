@@ -73,3 +73,68 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  aur-bin:
+    name: Publish AUR (campus-lms-bin)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: campus-lms-linux-x86_64
+          path: /tmp/binary
+
+      - name: Compute SHA256 and version
+        id: meta
+        run: |
+          echo "sha256=$(sha256sum /tmp/binary/campus-lms-linux-x86_64 | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Generate PKGBUILD for campus-lms-bin
+        run: |
+          mkdir -p /tmp/aur-bin
+          sed -e "s/pkgver=.*/pkgver=${{ steps.meta.outputs.version }}/" \
+              -e "s/sha256sums=(.*/sha256sums=(/" \
+              -e "/sha256sums=(/!b;n;c\    '${{ steps.meta.outputs.sha256 }}'" \
+              PKGBUILD-bin > /tmp/aur-bin/PKGBUILD
+          cp campus-lms.desktop campus-lms-daemon.service /tmp/aur-bin/
+
+      - name: Publish campus-lms-bin to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: campus-lms-bin
+          pkgbuild: /tmp/aur-bin/PKGBUILD
+          assets: |
+            /tmp/aur-bin/campus-lms.desktop
+            /tmp/aur-bin/campus-lms-daemon.service
+          commit_username: kenura
+          commit_email: kenura.gunarathna@thenex.global
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "Release v${{ steps.meta.outputs.version }}"
+          ssh_keyscan_types: rsa,ed25519
+
+  aur-git:
+    name: Publish AUR (campus-lms-git)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Publish campus-lms-git to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: campus-lms-git
+          pkgbuild: ./PKGBUILD
+          assets: |
+            campus-lms.desktop
+            campus-lms-daemon.service
+          commit_username: kenura
+          commit_email: kenura.gunarathna@thenex.global
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "Update from release v${{ github.ref_name }}"
+          ssh_keyscan_types: rsa,ed25519
