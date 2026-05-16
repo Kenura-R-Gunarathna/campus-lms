@@ -18,11 +18,23 @@ Desktop Moodle client for University of Colombo Faculty of Science, built with R
 
 ### Arch Linux (AUR)
 
+Pre-compiled binary (faster install, recommended):
+```bash
+paru -S campus-lms-bin
+# or
+yay -S campus-lms-bin
+```
+
+Build from source (tracks `main`):
 ```bash
 paru -S campus-lms-git
 # or
 yay -S campus-lms-git
 ```
+
+### Windows
+
+Download `campus-lms-windows-x86_64.exe` from the [latest release](https://github.com/Kenura-R-Gunarathna/campus-lms/releases/latest) and run.
 
 ### Other Linux (build from source)
 
@@ -65,6 +77,28 @@ cp target/release/campus-lms ~/.local/bin/campus-lms
 ## Diff Tracking
 
 Every time you open a course, the app compares current content against stored fingerprints and records what changed. The "What's New" panel shows recent changes with click-to-expand diffs. The full diff history screen shows a timeline of all snapshots with side-by-side comparison.
+
+## Updates
+
+The app checks GitHub for a newer release at most once every 24 hours. When a new version is found, a banner appears at the top of the window:
+
+- **AUR / system-installed**: banner suggests `yay -Syu` (or your package manager) to update.
+- **Standalone build**: banner links to the GitHub release for manual download.
+
+## Releasing (maintainers)
+
+Tag a release; CI builds binaries and auto-publishes both AUR packages:
+
+```bash
+make release v=X.Y.Z
+```
+
+This triggers `.github/workflows/release.yml` which:
+1. Builds Linux + Windows binaries via Cargo
+2. Creates the GitHub Release with both binaries attached
+3. Pushes updated PKGBUILDs + `.SRCINFO` to `campus-lms-bin` and `campus-lms-git` on AUR (SHA256 computed from the freshly built Linux binary)
+
+Required GitHub secret: `AUR_SSH_KEY` (private SSH key whose public key is registered on the AUR account).
 
 ## License
 

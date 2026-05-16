@@ -5,6 +5,25 @@ Format: `[version] - date — description`
 
 ---
 
+## [0.3.4] - 2026-05-16
+### Added
+- App icon (window + system) — installed under `/usr/share/icons/hicolor/512x512/apps/campus-lms.png` for AUR users
+- `campus-lms-bin` AUR package — pre-compiled binary install path (no Rust toolchain required)
+- Install-method detection — update banner now redirects AUR/system-managed installs to their package manager instead of suggesting an in-app overwrite
+- 24-hour cache on the GitHub-Releases update check (was hitting the API every app start)
+- Auto-publish release pipeline — `make release v=X.Y.Z` tags + pushes, GitHub Actions builds Linux/Windows binaries and pushes both AUR packages (`-bin` with SHA, `-git` with `.SRCINFO`) via SSH
+- Windows release binary attached to GitHub releases
+
+### Changed
+- Replaced Unicode arrow glyphs (▲ ▼) with `egui_phosphor::regular::CARET_UP/DOWN` so they render on all systems
+- `Cargo.toml` version field now tracks release tags (was stuck at 0.1.0)
+- `.desktop` `StartupWMClass=campus-lms` now matched by the window — set via `ViewportBuilder::with_app_id`, so launchers no longer show two taskbar entries
+
+### Fixed
+- AUR `campus-lms-bin` package now exists on the AUR (was only referenced in repo; never submitted)
+
+---
+
 ## [0.3.0] - 2026-05-03
 ### Added
 - Persistent login via OS keyring (GNOME Keyring / KWallet)

@@ -280,7 +280,14 @@ impl App {
             }
         }
 
-        background::check_for_updates(app.tx.clone());
+        let now_ts = chrono::Utc::now().timestamp();
+        let last_check = app.storage.get("last_update_check_ts").ok().flatten()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        if now_ts - last_check > 86400 {
+            let _ = app.storage.set("last_update_check_ts", &now_ts.to_string());
+            background::check_for_updates(app.tx.clone());
+        }
 
         app
     }
@@ -1341,16 +1348,26 @@ impl eframe::App for App {
                 self.show_settings_panel(ctx);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if let Some(new_ver) = self.update_version.clone() {
+                        let method = background::detect_install_method();
                         egui::Frame::none()
                             .fill(egui::Color32::from_rgb(40, 80, 150))
                             .rounding(4.0)
                             .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(format!("🚀 New version available: {new_ver}"))
+                                    let msg = match method {
+                                        background::InstallMethod::PackageManager =>
+                                            format!("🚀 New version available: {new_ver} — update via your package manager (e.g. `yay -Syu`)"),
+                                        _ => format!("🚀 New version available: {new_ver}"),
+                                    };
+                                    ui.label(egui::RichText::new(msg)
                                         .color(egui::Color32::WHITE).strong());
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Update Now").clicked() {
+                                        let btn_label = match method {
+                                            background::InstallMethod::PackageManager => "View Release Notes",
+                                            _ => "Update Now",
+                                        };
+                                        if ui.button(btn_label).clicked() {
                                             self.tx.send(AppMsg::OpenUrl("https://github.com/Kenura-R-Gunarathna/campus-lms/releases/latest".to_string())).ok();
                                         }
                                         if ui.button("Dismiss").clicked() {

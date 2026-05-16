@@ -38,6 +38,7 @@ async fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Campus LMS")
+            .with_app_id("campus-lms")
             .with_inner_size([980.0, 650.0])
             .with_icon(icon),
         ..Default::default()
